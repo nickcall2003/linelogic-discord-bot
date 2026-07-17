@@ -773,6 +773,9 @@ async def stock_command(interaction: discord.Interaction, symbol: str = ""):
 @bot.event
 async def on_ready():
     guild = discord.Object(id=GUILD_ID)
+    # Commands are defined globally; copy them into this guild so they register
+    # instantly (guild syncs are immediate; pure-global syncs can take ~1 hour).
+    bot.tree.copy_global_to(guild=guild)
     synced = await bot.tree.sync(guild=guild)
     log.info("Logged in as %s. Synced %d commands to guild %s", bot.user, len(synced), GUILD_ID)
 
