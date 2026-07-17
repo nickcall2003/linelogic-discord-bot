@@ -1,0 +1,4 @@
+# Pin Python for the build. Uses Nixpacks' Nix package (avoids mise attestation
+# failures on pinned patch versions). python312 = latest secure 3.12.x.
+[phases.setup]
+nixPkgs = ["python312", "gcc"]
