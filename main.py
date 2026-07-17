@@ -676,51 +676,70 @@ async def learn_command(interaction: discord.Interaction, term: str):
     await interaction.response.send_message(embed=embed)
 
 
-@bot.tree.command(name="record", description="Line Logic's tracked record, ROI, and closing line value")
-@app_commands.describe(days="Rolling window in days (default 30)")
-async def record_command(interaction: discord.Interaction, days: int = 30):
+@bot.tree.command(name="record", description="Line Logic's verified track record, units, and ROI")
+async def record_command(interaction: discord.Interaction):
     await interaction.response.defer()
     async with aiohttp.ClientSession() as session:
         try:
-            rec = await fetch_json(session, "/api/parlays/record", params={"days": days, "settle": "false"}, timeout=25)
+            # Same endpoint that powers the website Track Record page
+            data = await fetch_json(session, "/api/accuracy", params={"days": 30}, timeout=25)
         except Exception:
-            log.exception("record lookup failed for days=%s", days)
+            log.exception("accuracy lookup failed")
             await interaction.followup.send("Performance data isn't available right now.")
             return
-        # CLV is a separate endpoint; treat it as optional so /record still works if it fails
-        clv = None
-        try:
-            clv = await fetch_json(session, "/api/clv", params={"days": days}, timeout=20)
-        except Exception:
-            log.warning("CLV lookup failed; showing record without it")
 
-    wins, losses = rec.get("wins", 0), rec.get("losses", 0)
-    pushes, pending = rec.get("pushes", 0), rec.get("pending", 0)
-    record_str = f"{wins}-{losses}" + (f"-{pushes}" if pushes else "")
+    ov = data.get("overall", {})
+    by_sport = data.get("by_sport", {})
+    if not ov:
+        await interaction.followup.send("Performance data isn't available right now.")
+        return
 
-    embed = discord.Embed(title=f"📈 Line Logic — Last {rec.get('days', days)} Days", color=BRAND_COLOR, timestamp=now_utc())
-    embed.add_field(name="Record", value=record_str, inline=True)
-    win_pct = rec.get("win_pct")
-    embed.add_field(name="Win %", value=f"{win_pct}%" if win_pct is not None else "—", inline=True)
-    if pending:
-        embed.add_field(name="Pending", value=str(pending), inline=True)
-    units = rec.get("units_pl")
-    embed.add_field(name="Units", value=f"{units:+.2f}u" if isinstance(units, (int, float)) else "—", inline=True)
-    roi = rec.get("roi_pct")
-    embed.add_field(name="ROI", value=f"{roi:+.1f}%" if isinstance(roi, (int, float)) else "—", inline=True)
+    at_w = ov.get("alltime_wins", 0)
+    at_l = ov.get("alltime_losses", 0)
+    at_pct = ov.get("alltime_pct")
+    units = ov.get("units_30d")
+    roi = ov.get("roi_30d")
+    n_sports = len(by_sport)
 
-    if clv and clv.get("overall"):
-        ov = clv["overall"]
-        avg_clv = ov.get("avg_clv")
-        beat = ov.get("beat_close_pct")
-        if avg_clv is not None:
-            embed.add_field(
-                name="Closing Line Value",
-                value=f"Avg CLV {avg_clv:+.1f} • Beat close {beat}% of the time" if beat is not None else f"Avg CLV {avg_clv:+.1f}",
-                inline=False,
-            )
+    desc = f"**{at_pct}%** all-time · {at_w}-{at_l} across {n_sports} sports"
+    if isinstance(units, (int, float)):
+        desc += f"\n**{units:+.2f}u** on graded wagers (30d)"
 
-    embed.set_footer(text="Line Logic • thelinelogic.com")
+    embed = discord.Embed(
+        title="📈 Line Logic — Verified Track Record",
+        description=desc,
+        color=BRAND_COLOR,
+        timestamp=now_utc(),
+    )
+
+    SPORT_LABEL = {
+        "mlb": "⚾ MLB", "nba": "🏀 NBA", "wnba": "👟 WNBA", "nfl": "🏈 NFL",
+        "nhl": "🏒 NHL", "ncaaf": "🏟️ NCAA FB", "ncaab": "🎓 NCAA BB",
+        "ncaabb": "⚾ NCAA Baseball", "soccer": "⚽ Soccer", "tennis": "🎾 Tennis",
+        "ufc": "🥊 UFC", "golf": "⛳ Golf",
+    }
+    # rank sports by all-time wins so the biggest bodies of work show first
+    ranked = sorted(by_sport.items(),
+                    key=lambda kv: (kv[1].get("alltime_wins") or 0), reverse=True)
+    shown = 0
+    for sp, s in ranked:
+        if shown >= 8:
+            break
+        label = SPORT_LABEL.get(sp, sp.upper())
+        aw = s.get("alltime_wins", 0)
+        al = s.get("alltime_losses", 0)
+        apct = s.get("alltime_pct")
+        u = s.get("units_30d")
+        roi_s = s.get("roi_30d")
+        priced = s.get("priced_30d", 0)
+        if priced and isinstance(u, (int, float)):
+            val = f"{aw}-{al} ({apct}%) · **{u:+.2f}u** · {roi_s:+.1f}% ROI on {priced} wagers (30d)"
+        else:
+            val = f"{aw}-{al} ({apct}%) · +EV wagers building"
+        embed.add_field(name=label, value=val, inline=False)
+        shown += 1
+
+    embed.set_footer(text="Verified across every graded pick • thelinelogic.com")
     await interaction.followup.send(embed=embed)
 
 
