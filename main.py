@@ -228,7 +228,7 @@ async def today_command(interaction: discord.Interaction,
     params = {"sport": sport} if sport else None
     async with aiohttp.ClientSession() as session:
         try:
-            data = await fetch_json(session, "/api/picks/best", params=params)
+            data = await fetch_json(session, "/api/picks/quick", params=params, timeout=25)
         except Exception:
             log.exception("today lookup failed for %s", sport)
             await interaction.followup.send("Couldn't reach the model right now — try again shortly.")
@@ -278,7 +278,7 @@ def _prop_edge(p: dict):
 
 async def _games_for_sport(session, sport: str, ids_only: bool = False):
     path = "/api/mlb/games" if sport == "mlb" else f"/api/{sport}/games"
-    data = await fetch_json(session, path)
+    data = await fetch_json(session, path, timeout=25)
     games = data if isinstance(data, list) else (data.get("games") or [])
     return games
 
@@ -716,7 +716,7 @@ async def stock_command(interaction: discord.Interaction, symbol: str = ""):
         # No ticker -> the paper-model's "Hot Pick of the Day" (/api/stocks/hotpick)
         if not symbol:
             try:
-                data = await fetch_json(session, "/api/stocks/hotpick")
+                data = await fetch_json(session, "/api/stocks/hotpick", timeout=30)
             except Exception:
                 log.exception("hotpick failed")
                 await interaction.followup.send("Market data isn't available right now.")
@@ -746,7 +746,7 @@ async def stock_command(interaction: discord.Interaction, symbol: str = ""):
 
         # Ticker given -> on-demand quote (/api/stocks/quote)
         try:
-            data = await fetch_json(session, "/api/stocks/quote", params={"symbol": symbol, "range": "1D"})
+            data = await fetch_json(session, "/api/stocks/quote", params={"symbol": symbol, "range": "1D"}, timeout=25)
         except Exception:
             log.exception("stock quote failed for %s", symbol)
             await interaction.followup.send(f"Couldn't pull a quote for **{symbol}** right now.")
