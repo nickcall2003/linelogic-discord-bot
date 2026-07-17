@@ -218,47 +218,69 @@ async def model_command(interaction: discord.Interaction, name: str,
     await interaction.followup.send(embed=embed)
 
 
-@bot.tree.command(name="today", description="Today's top model edges, optionally filtered by sport")
-@app_commands.describe(sport="Optional: pick a sport (leave blank for all sports)")
-@app_commands.choices(sport=SPORT_CHOICES)
-async def today_command(interaction: discord.Interaction,
-                        sport: app_commands.Choice[str] | None = None):
+@bot.tree.command(name="today", description="Today's slate — how many games/matches are on the board per sport")
+async def today_command(interaction: discord.Interaction):
     await interaction.response.defer()
-    sport = sport.value if sport else ""
-    params = {"sport": sport} if sport else None
     async with aiohttp.ClientSession() as session:
         try:
-            data = await fetch_json(session, "/api/picks/quick", params=params, timeout=25)
+            data = await fetch_json(session, "/api/picks/quick", timeout=25)
         except Exception:
-            log.exception("today lookup failed for %s", sport)
+            log.exception("today slate lookup failed")
             await interaction.followup.send("Couldn't reach the model right now — try again shortly.")
             return
 
     picks = data.get("picks", [])
-    # Highest edge first; picks without a captured market line sink to the bottom
-    picks.sort(key=lambda p: (p.get("edge_pct") is not None, p.get("edge_pct") or -999), reverse=True)
-    picks = picks[:5]
-
-    label = sport.upper() if sport else "All Sports"
     if not picks:
-        await interaction.followup.send(f"No {label} plays on the board today.")
+        await interaction.followup.send("Nothing on the board today yet.")
         return
 
+    # Count unique games per sport (a pick = a game/match on the board)
+    from collections import Counter
+    counts = Counter(str(p.get("sport", "")).lower() for p in picks if p.get("sport"))
+
+    # Display names + the unit each sport is counted in, in a sensible order
+    SPORT_DISPLAY = [
+        ("mlb", "⚾ Baseball", "games"),
+        ("nba", "🏀 Basketball", "games"),
+        ("wnba", "👟 WNBA", "games"),
+        ("nfl", "🏈 Football", "games"),
+        ("ncaaf", "🏟️ College Football", "games"),
+        ("ncaab", "🎓 College Basketball", "games"),
+        ("nhl", "🏒 Hockey", "games"),
+        ("soccer", "⚽ Soccer", "matches"),
+        ("tennis", "🎾 Tennis", "matches"),
+        ("ufc", "🥊 UFC", "fights"),
+        ("golf", "⛳ Golf", "events"),
+    ]
+
+    lines = []
+    total = 0
+    listed = set()
+    for key, label, unit in SPORT_DISPLAY:
+        n = counts.get(key, 0)
+        if n:
+            lines.append(f"{label}: **{n}** {unit}")
+            total += n
+            listed.add(key)
+    # catch any sport not in the display list
+    for key, n in counts.items():
+        if key not in listed and n:
+            lines.append(f"{key.upper()}: **{n}**")
+            total += n
+
     embed = discord.Embed(
-        title=f"⚡ Today's Top Edges — {label}",
+        title="📅 Today's Line Logic Slate",
+        description="\n".join(lines),
         color=BRAND_COLOR,
         timestamp=now_utc(),
     )
-    for p in picks:
-        edge = p.get("edge_pct")
-        edge_str = f"+{edge:.1f}%" if isinstance(edge, (int, float)) else "—"
-        prob_pct = round((p.get("prob") or 0) * 100)
-        embed.add_field(
-            name=f"{p.get('pick', '—')}  ({str(p.get('sport','')).upper()})",
-            value=f"{p.get('match', '')}\nWin: {prob_pct}% • Market: {_fmt_odds(p.get('market_odds'))} • Edge: **{edge_str}**",
-            inline=False,
-        )
-    embed.set_footer(text="Line Logic Model • thelinelogic.com")
+    embed.add_field(name="Total on the board", value=f"**{total}**", inline=False)
+    embed.add_field(
+        name="Want the plays?",
+        value="Use `/model [team]` for a specific read, or check the daily model feed for the top edges.",
+        inline=False,
+    )
+    embed.set_footer(text="Line Logic • thelinelogic.com")
     await interaction.followup.send(embed=embed)
 
 
