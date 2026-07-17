@@ -568,7 +568,7 @@ async def writeup_command(interaction: discord.Interaction, query: str):
         return
     async with aiohttp.ClientSession() as session:
         try:
-            data = await fetch_json(session, "/api/generate", params={"q": query, "mode": "writeup"})
+            data = await fetch_json(session, "/api/generate", params={"q": query, "mode": "writeup"}, timeout=40)
         except Exception:
             log.exception("writeup failed for %s", query)
             await interaction.followup.send(f"Couldn't generate a write-up for **{query}** right now.")
@@ -579,10 +579,15 @@ async def writeup_command(interaction: discord.Interaction, query: str):
         return
 
     # Write-ups can exceed Discord's 2000-char message limit — chunk safely.
-    text = str(data["content"])
+    text = str(data["content"]).strip()
     header = f"🧠 **{data.get('pick', query)}** — {data.get('match', '')}\n\n"
     text = header + text
+    # split into <=1900 char chunks, skipping any empty ones
     chunks = [text[i:i + 1900] for i in range(0, len(text), 1900)]
+    chunks = [c for c in chunks if c.strip()]
+    if not chunks:
+        await interaction.followup.send(f"No write-up available for **{query}** right now.")
+        return
     await interaction.followup.send(chunks[0])
     for extra in chunks[1:]:
         await interaction.followup.send(extra)
@@ -677,7 +682,7 @@ async def record_command(interaction: discord.Interaction, days: int = 30):
     await interaction.response.defer()
     async with aiohttp.ClientSession() as session:
         try:
-            rec = await fetch_json(session, "/api/parlays/record", params={"days": days})
+            rec = await fetch_json(session, "/api/parlays/record", params={"days": days, "settle": "false"}, timeout=25)
         except Exception:
             log.exception("record lookup failed for days=%s", days)
             await interaction.followup.send("Performance data isn't available right now.")
@@ -685,7 +690,7 @@ async def record_command(interaction: discord.Interaction, days: int = 30):
         # CLV is a separate endpoint; treat it as optional so /record still works if it fails
         clv = None
         try:
-            clv = await fetch_json(session, "/api/clv", params={"days": days})
+            clv = await fetch_json(session, "/api/clv", params={"days": days}, timeout=20)
         except Exception:
             log.warning("CLV lookup failed; showing record without it")
 
