@@ -676,8 +676,61 @@ async def learn_command(interaction: discord.Interaction, term: str):
     await interaction.response.send_message(embed=embed)
 
 
-@bot.tree.command(name="record", description="Line Logic's verified track record, units, and ROI")
-async def record_command(interaction: discord.Interaction):
+@bot.tree.command(name="track", description="Track a pick to your capper record (model-board picks only)")
+@app_commands.describe(
+    pick="Team or player, e.g. Braves",
+    units="How many units (default 1)",
+    sport="Optional: narrow the sport",
+)
+@app_commands.choices(sport=SPORT_CHOICES)
+async def track_command(interaction: discord.Interaction, pick: str,
+                        units: float = 1.0,
+                        sport: app_commands.Choice[str] | None = None):
+    await interaction.response.defer()
+    body = {
+        "user_id": str(interaction.user.id),
+        "username": interaction.user.display_name,
+        "team": pick,
+        "stake_units": units,
+    }
+    if sport:
+        body["sport"] = sport.value
+
+    async with aiohttp.ClientSession() as session:
+        try:
+            url = f"{LINE_LOGIC_API_BASE}/api/capper/track"
+            headers = {"Authorization": f"Bearer {LINE_LOGIC_API_KEY}"} if LINE_LOGIC_API_KEY else {}
+            async with session.post(url, json=body, headers=headers,
+                                    timeout=aiohttp.ClientTimeout(total=25)) as resp:
+                data = await resp.json()
+        except Exception:
+            log.exception("track failed for %s", pick)
+            await interaction.followup.send("Couldn't track that right now — try again shortly.")
+            return
+
+    if not data.get("ok"):
+        if data.get("error") == "not_on_board":
+            await interaction.followup.send(
+                f"**{pick}** isn't on the model board right now, so it can't be tracked yet. "
+                f"You can only track picks the model has on the current slate."
+            )
+        else:
+            await interaction.followup.send("Couldn't track that pick — check the name and try again.")
+        return
+
+    odds = data.get("market_odds")
+    odds_str = _fmt_odds(odds)
+    embed = discord.Embed(
+        title="✅ Pick Tracked",
+        description=f"**{data.get('pick')}**\n{data.get('match','')}",
+        color=0x2ECC71,
+        timestamp=now_utc(),
+    )
+    embed.add_field(name="Sport", value=str(data.get("sport", "—")).upper(), inline=True)
+    embed.add_field(name="Odds", value=odds_str, inline=True)
+    embed.add_field(name="Stake", value=f"{data.get('stake_units', 1)}u", inline=True)
+    embed.set_footer(text=f"Tracked by {interaction.user.display_name} • graded after the game")
+    await interaction.followup.send(embed=embed)
     await interaction.response.defer()
     async with aiohttp.ClientSession() as session:
         try:
