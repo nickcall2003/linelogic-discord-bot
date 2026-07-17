@@ -731,6 +731,98 @@ async def track_command(interaction: discord.Interaction, pick: str,
     embed.add_field(name="Stake", value=f"{data.get('stake_units', 1)}u", inline=True)
     embed.set_footer(text=f"Tracked by {interaction.user.display_name} • graded after the game")
     await interaction.followup.send(embed=embed)
+
+
+@bot.tree.command(name="mystats", description="Your capper record — tracked picks, W/L, units, ROI")
+async def mystats_command(interaction: discord.Interaction):
+    await interaction.response.defer()
+    async with aiohttp.ClientSession() as session:
+        try:
+            data = await fetch_json(session, "/api/capper/stats",
+                                    params={"user_id": str(interaction.user.id)}, timeout=20)
+        except Exception:
+            log.exception("mystats failed")
+            await interaction.followup.send("Couldn't pull your stats right now — try again shortly.")
+            return
+
+    if not data.get("total"):
+        await interaction.followup.send(
+            "You haven't tracked any picks yet. Use `/track [team]` to start your record."
+        )
+        return
+
+    units = data.get("units_pl")
+    roi = data.get("roi_pct")
+    win_pct = data.get("win_pct")
+    embed = discord.Embed(
+        title=f"📊 {interaction.user.display_name}'s Capper Record",
+        color=BRAND_COLOR,
+        timestamp=now_utc(),
+    )
+    embed.add_field(name="Record", value=data.get("record", "0-0"), inline=True)
+    embed.add_field(name="Win %", value=f"{win_pct}%" if win_pct is not None else "—", inline=True)
+    embed.add_field(name="Pending", value=str(data.get("pending", 0)), inline=True)
+    embed.add_field(name="Units", value=f"{units:+.2f}u" if isinstance(units, (int, float)) else "—", inline=True)
+    embed.add_field(name="ROI", value=f"{roi:+.1f}%" if isinstance(roi, (int, float)) else "—", inline=True)
+    embed.add_field(name="Total Tracked", value=str(data.get("total", 0)), inline=True)
+    embed.set_footer(text="Line Logic • track picks with /track")
+    await interaction.followup.send(embed=embed)
+
+
+@bot.tree.command(name="cappers", description="The capper leaderboard — top tracked records in the server")
+@app_commands.describe(sort="Rank by units won (default) or win %")
+@app_commands.choices(sort=[
+    app_commands.Choice(name="Units", value="units"),
+    app_commands.Choice(name="Win %", value="winpct"),
+])
+async def cappers_command(interaction: discord.Interaction,
+                          sort: app_commands.Choice[str] | None = None):
+    await interaction.response.defer()
+    sort_val = sort.value if sort else "units"
+    async with aiohttp.ClientSession() as session:
+        try:
+            data = await fetch_json(session, "/api/capper/leaderboard",
+                                    params={"sort": sort_val}, timeout=20)
+        except Exception:
+            log.exception("cappers failed")
+            await interaction.followup.send("Couldn't load the leaderboard right now — try again shortly.")
+            return
+
+    cappers = data.get("cappers", [])
+    if not cappers:
+        building = data.get("building", 0)
+        msg = "No ranked cappers yet — records show up here once picks are graded."
+        if building:
+            msg += f" ({building} capper{'s' if building != 1 else ''} building a record.)"
+        await interaction.followup.send(msg)
+        return
+
+    medals = ["🥇", "🥈", "🥉"]
+    lines = []
+    for i, c in enumerate(cappers):
+        rank = medals[i] if i < 3 else f"**{i+1}.**"
+        units = c.get("units_pl", 0)
+        roi = c.get("roi_pct")
+        rec = c.get("record", "0-0")
+        roi_str = f" · {roi:+.1f}% ROI" if isinstance(roi, (int, float)) else ""
+        lines.append(f"{rank} **{c.get('username','capper')}** — {units:+.2f}u ({rec}){roi_str}")
+
+    embed = discord.Embed(
+        title="🏆 Capper Leaderboard",
+        description="\n".join(lines),
+        color=BRAND_COLOR,
+        timestamp=now_utc(),
+    )
+    label = "units won" if sort_val == "units" else "win %"
+    footer = f"Ranked by {label}"
+    if data.get("building"):
+        footer += f" • {data['building']} still building a record"
+    embed.set_footer(text=footer)
+    await interaction.followup.send(embed=embed)
+
+
+@bot.tree.command(name="record", description="Line Logic's verified track record, units, and ROI")
+async def record_command(interaction: discord.Interaction):
     await interaction.response.defer()
     async with aiohttp.ClientSession() as session:
         try:
