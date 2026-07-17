@@ -100,10 +100,10 @@ PROP_SPORT_CHOICES = [
 
 # ---------- Helpers ----------
 
-async def fetch_json(session: aiohttp.ClientSession, path: str, params: dict | None = None):
+async def fetch_json(session: aiohttp.ClientSession, path: str, params: dict | None = None, timeout: int = 10):
     url = f"{LINE_LOGIC_API_BASE}{path}"
     headers = {"Authorization": f"Bearer {LINE_LOGIC_API_KEY}"} if LINE_LOGIC_API_KEY else {}
-    async with session.get(url, params=params, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+    async with session.get(url, params=params, headers=headers, timeout=aiohttp.ClientTimeout(total=timeout)) as resp:
         resp.raise_for_status()
         return await resp.json()
 
