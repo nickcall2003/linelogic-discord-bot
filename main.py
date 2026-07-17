@@ -223,20 +223,16 @@ async def today_command(interaction: discord.Interaction):
     await interaction.response.defer()
     async with aiohttp.ClientSession() as session:
         try:
-            data = await fetch_json(session, "/api/picks/quick", timeout=25)
+            data = await fetch_json(session, "/api/slate", timeout=25)
         except Exception:
             log.exception("today slate lookup failed")
             await interaction.followup.send("Couldn't reach the model right now — try again shortly.")
             return
 
-    picks = data.get("picks", [])
-    if not picks:
+    counts = data.get("counts", {}) or {}
+    if not counts:
         await interaction.followup.send("Nothing on the board today yet.")
         return
-
-    # Count unique games per sport (a pick = a game/match on the board)
-    from collections import Counter
-    counts = Counter(str(p.get("sport", "")).lower() for p in picks if p.get("sport"))
 
     # Display names + the unit each sport is counted in, in a sensible order
     SPORT_DISPLAY = [
@@ -254,19 +250,18 @@ async def today_command(interaction: discord.Interaction):
     ]
 
     lines = []
-    total = 0
     listed = set()
     for key, label, unit in SPORT_DISPLAY:
         n = counts.get(key, 0)
         if n:
             lines.append(f"{label}: **{n}** {unit}")
-            total += n
             listed.add(key)
     # catch any sport not in the display list
     for key, n in counts.items():
         if key not in listed and n:
             lines.append(f"{key.upper()}: **{n}**")
-            total += n
+
+    total = data.get("total", sum(counts.values()))
 
     embed = discord.Embed(
         title="📅 Today's Line Logic Slate",
