@@ -1231,6 +1231,65 @@ async def postdaily_command(interaction: discord.Interaction):
     )
 
 
+@bot.tree.command(name="verifyall", description="(Staff) Give the Verified Member role to everyone who doesn't have it")
+async def verifyall_command(interaction: discord.Interaction):
+    perms = getattr(interaction.user, "guild_permissions", None)
+    if not perms or not (perms.manage_guild or perms.administrator):
+        await interaction.response.send_message("That's a staff-only command.", ephemeral=True)
+        return
+    if not VERIFIED_ROLE_ID:
+        await interaction.response.send_message(
+            "VERIFIED_ROLE_ID isn't set in the bot's environment.", ephemeral=True)
+        return
+
+    guild = interaction.guild
+    role = guild.get_role(VERIFIED_ROLE_ID) if guild else None
+    if role is None:
+        await interaction.response.send_message(
+            f"Couldn't find the Verified Member role (`{VERIFIED_ROLE_ID}`).", ephemeral=True)
+        return
+    if guild.me.top_role <= role:
+        await interaction.response.send_message(
+            "LineBot's role sits below Verified Member, so it can't assign it. "
+            "Drag LineBot above it in Server Settings → Roles, then run this again.",
+            ephemeral=True)
+        return
+
+    await interaction.response.send_message(
+        "Starting the backfill — this runs in the background and can take a few "
+        "minutes on a large server. I'll report back here when it's done.",
+        ephemeral=True)
+
+    async def _run_backfill():
+        added = skipped = failed = 0
+        try:
+            async for member in guild.fetch_members(limit=None):
+                if member.bot or role in member.roles:
+                    skipped += 1
+                    continue
+                try:
+                    await member.add_roles(role, reason="Verified Member backfill")
+                    added += 1
+                    await asyncio.sleep(0.6)      # stay well inside Discord's rate limits
+                except discord.Forbidden:
+                    failed += 1
+                except Exception:
+                    failed += 1
+        except Exception:
+            log.exception("verifyall backfill failed")
+
+        summary = (f"✅ Verified Member backfill complete — **{added}** added, "
+                   f"{skipped} already had it or were bots"
+                   + (f", {failed} failed" if failed else "") + ".")
+        try:
+            await interaction.followup.send(summary, ephemeral=True)
+        except Exception:
+            pass
+        await bot_log(summary)
+
+    asyncio.create_task(_run_backfill())
+
+
 @bot.tree.command(name="ladder", description="The Ladder Challenge — current rung, bankroll, and today's leg")
 async def ladder_command(interaction: discord.Interaction):
     await interaction.response.defer()
