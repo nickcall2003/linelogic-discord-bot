@@ -213,22 +213,33 @@ async def build_daily_card():
     return embed, (" ".join(mentions) if mentions else None)
 
 
-async def post_daily_card() -> bool:
+async def post_daily_card() -> tuple[bool, str]:
+    """Returns (ok, reason). Reason is surfaced to staff so failures are obvious."""
     channel_id = CHANNEL_IDS.get("daily_model")
     if not channel_id:
-        log.warning("daily post: CHANNEL_DAILY_MODEL not set")
-        return False
+        return False, "CHANNEL_DAILY_MODEL isn't set in the bot's environment."
     channel = bot.get_channel(channel_id)
     if channel is None:
-        log.warning("daily post: channel %s not found", channel_id)
-        return False
+        # not in cache — fetch it directly (also surfaces permission problems)
+        try:
+            channel = await bot.fetch_channel(channel_id)
+        except discord.Forbidden:
+            return False, f"No access to channel `{channel_id}` — check LineBot's View Channel / Send Messages permission there."
+        except discord.NotFound:
+            return False, f"Channel `{channel_id}` doesn't exist — is CHANNEL_DAILY_MODEL the right ID?"
+        except Exception as e:
+            return False, f"Couldn't load channel `{channel_id}`: {e}"
     embed, mentions = await build_daily_card()
     if embed is None:
-        await bot_log("Daily post skipped — couldn't reach the model.")
-        return False
-    await channel.send(content=mentions or None, embed=embed)
+        return False, "Couldn't reach the model (the /api/picks/quick call failed)."
+    try:
+        await channel.send(content=mentions or None, embed=embed)
+    except discord.Forbidden:
+        return False, f"Can't post in <#{channel_id}> — LineBot needs Send Messages + Embed Links there."
+    except Exception as e:
+        return False, f"Send failed: {e}"
     await bot_log("Posted the daily model card.")
-    return True
+    return True, "posted"
 
 
 @tasks.loop(time=dtime(hour=DAILY_POST_HOUR_UTC, minute=0, tzinfo=timezone.utc))
@@ -236,7 +247,10 @@ async def daily_post_loop():
     if not DAILY_POST_ENABLED:
         return
     try:
-        await post_daily_card()
+        ok, reason = await post_daily_card()
+        if not ok:
+            log.warning("daily post skipped: %s", reason)
+            await bot_log(f"Daily post skipped — {reason}")
     except Exception:
         log.exception("daily post loop failed")
 
@@ -958,10 +972,9 @@ async def postdaily_command(interaction: discord.Interaction):
             "That's a staff-only command.", ephemeral=True)
         return
     await interaction.response.defer(ephemeral=True)
-    ok = await post_daily_card()
+    ok, reason = await post_daily_card()
     await interaction.followup.send(
-        "Posted the daily card." if ok else
-        "Couldn't post — check that CHANNEL_DAILY_MODEL is set and the model is reachable.",
+        "Posted the daily card." if ok else f"Couldn't post — {reason}",
         ephemeral=True,
     )
 
