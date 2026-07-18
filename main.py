@@ -1,13 +1,13 @@
 import os
 import asyncio
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timezone, time as dtime
 
 import aiohttp
 from aiohttp import web
 import discord
 from discord import app_commands
-from discord.ext import commands
+from discord.ext import commands, tasks
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("linelogic-bot")
@@ -115,6 +115,135 @@ def now_utc():
 def role_mention(sport_key: str) -> str | None:
     role_id = NOTIFY_ROLE_IDS.get(sport_key)
     return f"<@&{role_id}>" if role_id else None
+
+
+# ---------- Daily auto-post ----------
+# Posts the day's card to #daily-model on a schedule. Runs entirely from the bot
+# (no backend webhook needed) so there's one place to look when something breaks.
+
+DAILY_POST_HOUR_UTC = int(os.environ.get("DAILY_POST_HOUR_UTC", "15"))   # 15:00 UTC ≈ 10am CT
+DAILY_MIN_EDGE = float(os.environ.get("DAILY_MIN_EDGE", "3"))           # % edge to qualify
+DAILY_MAX_PLAYS = int(os.environ.get("DAILY_MAX_PLAYS", "5"))
+DAILY_POST_ENABLED = os.environ.get("DAILY_POST_ENABLED", "1") == "1"
+
+SPORT_LABEL_MAP = {
+    "mlb": ("⚾", "Baseball", "games"), "nba": ("🏀", "Basketball", "games"),
+    "wnba": ("👟", "WNBA", "games"), "nfl": ("🏈", "Football", "games"),
+    "nhl": ("🏒", "Hockey", "games"), "ncaaf": ("🏟️", "College Football", "games"),
+    "ncaab": ("🎓", "College Basketball", "games"), "soccer": ("⚽", "Soccer", "matches"),
+    "tennis": ("🎾", "Tennis", "matches"), "ufc": ("🥊", "UFC", "fights"),
+    "golf": ("⛳", "Golf", "events"),
+}
+
+
+async def build_daily_card():
+    """Returns (embed, mention_string). Always returns an embed — if the model
+    found no qualifying edges we say so plainly rather than posting nothing."""
+    async with aiohttp.ClientSession() as session:
+        slate = {}
+        try:
+            slate = await fetch_json(session, "/api/slate", timeout=25)
+        except Exception:
+            log.warning("daily card: slate fetch failed")
+        try:
+            data = await fetch_json(session, "/api/picks/quick", timeout=25)
+        except Exception:
+            log.exception("daily card: picks fetch failed")
+            return None, None
+
+    picks = data.get("picks", []) or []
+    edges = [p for p in picks
+             if isinstance(p.get("edge_pct"), (int, float))
+             and p["edge_pct"] >= DAILY_MIN_EDGE
+             and p.get("market_odds") is not None]
+    edges.sort(key=lambda p: p["edge_pct"], reverse=True)
+    edges = edges[:DAILY_MAX_PLAYS]
+
+    counts = (slate.get("counts") or {})
+    slate_bits = []
+    for key, (emoji, label, unit) in SPORT_LABEL_MAP.items():
+        n = counts.get(key, 0)
+        if n:
+            slate_bits.append(f"{emoji} {label}: **{n}** {unit}")
+
+    if edges:
+        embed = discord.Embed(
+            title="📈 Today's Line Logic Model",
+            description=f"Top {len(edges)} value play{'s' if len(edges) != 1 else ''} the model found today.",
+            color=BRAND_COLOR,
+            timestamp=now_utc(),
+        )
+        for p in edges:
+            prob_pct = round((p.get("prob") or 0) * 100)
+            edge = p.get("edge_pct")
+            embed.add_field(
+                name=f"{p.get('pick','—')}  ({str(p.get('sport','')).upper()})",
+                value=(f"{p.get('match','')}\n"
+                       f"Model: **{prob_pct}%** • Market: {_fmt_odds(p.get('market_odds'))} "
+                       f"• Edge: **+{edge:.1f}%**"),
+                inline=False,
+            )
+    else:
+        embed = discord.Embed(
+            title="📈 Today's Line Logic Model",
+            description=("No qualifying edges today — the model didn't find value "
+                         "worth posting at current prices. No play is better than a bad play."),
+            color=BRAND_COLOR,
+            timestamp=now_utc(),
+        )
+
+    if slate_bits:
+        embed.add_field(name="On the board today", value="\n".join(slate_bits), inline=False)
+    embed.add_field(
+        name="Want the reasoning?",
+        value="`/why [team]` for the model's logic • `/model [team]` for any team's read",
+        inline=False,
+    )
+    embed.set_footer(text="Value plays, not guarantees • thelinelogic.com")
+
+    mentions = []
+    seen = set()
+    for p in edges:
+        sp = str(p.get("sport", "")).lower()
+        if sp and sp not in seen:
+            m = role_mention(sp)
+            if m:
+                mentions.append(m)
+            seen.add(sp)
+    return embed, (" ".join(mentions) if mentions else None)
+
+
+async def post_daily_card() -> bool:
+    channel_id = CHANNEL_IDS.get("daily_model")
+    if not channel_id:
+        log.warning("daily post: CHANNEL_DAILY_MODEL not set")
+        return False
+    channel = bot.get_channel(channel_id)
+    if channel is None:
+        log.warning("daily post: channel %s not found", channel_id)
+        return False
+    embed, mentions = await build_daily_card()
+    if embed is None:
+        await bot_log("Daily post skipped — couldn't reach the model.")
+        return False
+    await channel.send(content=mentions or None, embed=embed)
+    await bot_log("Posted the daily model card.")
+    return True
+
+
+@tasks.loop(time=dtime(hour=DAILY_POST_HOUR_UTC, minute=0, tzinfo=timezone.utc))
+async def daily_post_loop():
+    if not DAILY_POST_ENABLED:
+        return
+    try:
+        await post_daily_card()
+    except Exception:
+        log.exception("daily post loop failed")
+
+
+@daily_post_loop.before_loop
+async def _before_daily_post():
+    await bot.wait_until_ready()
 
 
 # ---------- Slash commands ----------
@@ -821,6 +950,22 @@ async def cappers_command(interaction: discord.Interaction,
     await interaction.followup.send(embed=embed)
 
 
+@bot.tree.command(name="postdaily", description="(Staff) Post the daily model card now")
+async def postdaily_command(interaction: discord.Interaction):
+    perms = getattr(interaction.user, "guild_permissions", None)
+    if not perms or not (perms.manage_guild or perms.administrator):
+        await interaction.response.send_message(
+            "That's a staff-only command.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    ok = await post_daily_card()
+    await interaction.followup.send(
+        "Posted the daily card." if ok else
+        "Couldn't post — check that CHANNEL_DAILY_MODEL is set and the model is reachable.",
+        ephemeral=True,
+    )
+
+
 @bot.tree.command(name="record", description="Line Logic's verified track record, units, and ROI")
 async def record_command(interaction: discord.Interaction):
     await interaction.response.defer()
@@ -964,6 +1109,9 @@ async def on_ready():
     bot.tree.copy_global_to(guild=guild)
     synced = await bot.tree.sync(guild=guild)
     log.info("Logged in as %s. Synced %d commands to guild %s", bot.user, len(synced), GUILD_ID)
+    if DAILY_POST_ENABLED and not daily_post_loop.is_running():
+        daily_post_loop.start()
+        log.info("Daily post scheduled for %02d:00 UTC", DAILY_POST_HOUR_UTC)
 
 
 async def bot_log(message: str):
