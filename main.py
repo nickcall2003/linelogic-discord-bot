@@ -450,9 +450,10 @@ async def build_ladder_embed():
 
 
 async def post_ladder_card() -> tuple[bool, str]:
-    channel_id = LADDER_CHANNEL_ID or CHANNEL_IDS.get("daily_model")
+    channel_id = LADDER_CHANNEL_ID
     if not channel_id:
-        return False, "No channel set (CHANNEL_LADDER or CHANNEL_DAILY_MODEL)."
+        return False, ("CHANNEL_LADDER isn't set — the ladder posts to its own "
+                       "channel, so set that variable to the Ladder Challenge channel ID.")
     channel = bot.get_channel(channel_id)
     if channel is None:
         try:
