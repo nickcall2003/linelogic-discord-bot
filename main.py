@@ -296,9 +296,10 @@ async def _sync_top_capper_role(top_user_id: str | None):
 
 
 async def post_capper_leaderboard() -> tuple[bool, str]:
-    channel_id = CAPPER_CHANNEL_ID or CHANNEL_IDS.get("daily_model")
+    channel_id = CAPPER_CHANNEL_ID
     if not channel_id:
-        return False, "No channel set (CHANNEL_CAPPERS or CHANNEL_DAILY_MODEL)."
+        return False, ("CHANNEL_CAPPERS isn't set — the leaderboard posts to its own "
+                       "channel, so set that variable to the capper channel ID.")
     channel = bot.get_channel(channel_id)
     if channel is None:
         try:
@@ -1231,6 +1232,33 @@ async def postdaily_command(interaction: discord.Interaction):
     )
 
 
+@bot.tree.command(name="permcheck", description="(Staff) Show what LineBot can actually do in a channel")
+@app_commands.describe(channel="Channel to check (defaults to this one)")
+async def permcheck_command(interaction: discord.Interaction,
+                            channel: discord.TextChannel | None = None):
+    perms = getattr(interaction.user, "guild_permissions", None)
+    if not perms or not (perms.manage_guild or perms.administrator):
+        await interaction.response.send_message("That's a staff-only command.", ephemeral=True)
+        return
+    ch = channel or interaction.channel
+    me = interaction.guild.me
+    p = ch.permissions_for(me)
+    checks = [
+        ("View Channel", p.view_channel),
+        ("Send Messages", p.send_messages),
+        ("Embed Links", p.embed_links),
+        ("Read Message History", p.read_message_history),
+        ("Mention Everyone (role pings)", p.mention_everyone),
+        ("Manage Roles (server-wide)", me.guild_permissions.manage_roles),
+    ]
+    lines = [f"{'✅' if ok else '❌'} {name}" for name, ok in checks]
+    cat = ch.category.name if ch.category else "— none —"
+    synced = "yes" if (ch.category and ch.permissions_synced) else "no"
+    body = (f"**#{ch.name}**\nCategory: {cat} · Synced to category: {synced}\n\n"
+            + "\n".join(lines))
+    await interaction.response.send_message(body, ephemeral=True)
+
+
 @bot.tree.command(name="verifyall", description="(Staff) Give the Verified Member role to everyone who doesn't have it")
 async def verifyall_command(interaction: discord.Interaction):
     perms = getattr(interaction.user, "guild_permissions", None)
@@ -1263,18 +1291,32 @@ async def verifyall_command(interaction: discord.Interaction):
     async def _run_backfill():
         added = skipped = failed = 0
         try:
-            async for member in guild.fetch_members(limit=None):
-                if member.bot or role in member.roles:
-                    skipped += 1
-                    continue
+            # Load the member list from the gateway in one pass (fast, cached),
+            # rather than streaming the HTTP endpoint while also writing roles —
+            # interleaving those two makes Discord throttle aggressively.
+            if not guild.chunked:
+                await guild.chunk(cache=True)
+            members = list(guild.members)
+            todo = [m for m in members if not m.bot and role not in m.roles]
+            total = len(todo)
+            await bot_log(f"Verified backfill starting — {total} member(s) need the role.")
+
+            for i, member in enumerate(todo, 1):
                 try:
                     await member.add_roles(role, reason="Verified Member backfill")
                     added += 1
-                    await asyncio.sleep(0.6)      # stay well inside Discord's rate limits
                 except discord.Forbidden:
                     failed += 1
+                except discord.HTTPException as e:
+                    failed += 1
+                    if e.status == 429:          # rate limited — ease off
+                        await asyncio.sleep(5)
                 except Exception:
                     failed += 1
+                await asyncio.sleep(0.25)
+                if i % 50 == 0:
+                    await bot_log(f"Verified backfill: {i}/{total} processed ({added} added).")
+            skipped = len(members) - total
         except Exception:
             log.exception("verifyall backfill failed")
 
