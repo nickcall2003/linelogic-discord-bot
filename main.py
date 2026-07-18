@@ -260,6 +260,119 @@ async def _before_daily_post():
     await bot.wait_until_ready()
 
 
+# ---------- Weekly capper leaderboard + Top Capper role ----------
+
+WEEKLY_POST_HOUR_UTC = int(os.environ.get("WEEKLY_POST_HOUR_UTC", "16"))  # ~11am CT
+WEEKLY_POST_WEEKDAY = int(os.environ.get("WEEKLY_POST_WEEKDAY", "0"))     # 0=Monday
+TOP_CAPPER_ROLE_ID = int(os.environ.get("TOP_CAPPER_ROLE_ID", "0"))
+CAPPER_CHANNEL_ID = int(os.environ.get("CHANNEL_CAPPERS", "0"))
+WEEKLY_POST_ENABLED = os.environ.get("WEEKLY_POST_ENABLED", "1") == "1"
+
+
+async def _sync_top_capper_role(top_user_id: str | None):
+    """Give the Top Capper role to the current leader, remove it from everyone
+    else. Silently does nothing if TOP_CAPPER_ROLE_ID isn't configured."""
+    if not TOP_CAPPER_ROLE_ID or not top_user_id:
+        return
+    guild = bot.get_guild(GUILD_ID)
+    if guild is None:
+        return
+    role = guild.get_role(TOP_CAPPER_ROLE_ID)
+    if role is None:
+        log.warning("top capper: role %s not found", TOP_CAPPER_ROLE_ID)
+        return
+    try:
+        for member in list(role.members):
+            if str(member.id) != str(top_user_id):
+                await member.remove_roles(role, reason="No longer top capper")
+        winner = guild.get_member(int(top_user_id))
+        if winner and role not in winner.roles:
+            await winner.add_roles(role, reason="Top capper this week")
+    except discord.Forbidden:
+        log.warning("top capper: missing Manage Roles or role is above LineBot")
+    except Exception:
+        log.exception("top capper role sync failed")
+
+
+async def post_capper_leaderboard() -> tuple[bool, str]:
+    channel_id = CAPPER_CHANNEL_ID or CHANNEL_IDS.get("daily_model")
+    if not channel_id:
+        return False, "No channel set (CHANNEL_CAPPERS or CHANNEL_DAILY_MODEL)."
+    channel = bot.get_channel(channel_id)
+    if channel is None:
+        try:
+            channel = await bot.fetch_channel(channel_id)
+        except Exception as e:
+            return False, f"Couldn't load channel `{channel_id}`: {e}"
+
+    async with aiohttp.ClientSession() as session:
+        try:
+            data = await fetch_json(session, "/api/capper/leaderboard",
+                                    params={"sort": "units"}, timeout=25)
+        except Exception:
+            log.exception("weekly leaderboard fetch failed")
+            return False, "Couldn't reach the leaderboard."
+
+    cappers = data.get("cappers", []) or []
+    if not cappers:
+        building = data.get("building", 0)
+        embed = discord.Embed(
+            title="🏆 Capper Leaderboard",
+            description=("No graded records yet this week. Track your plays with "
+                         "`/track [team]` and you'll show up here once they settle."
+                         + (f"\n\n{building} capper{'s' if building != 1 else ''} building a record."
+                            if building else "")),
+            color=BRAND_COLOR, timestamp=now_utc(),
+        )
+        await channel.send(embed=embed)
+        return True, "posted (empty)"
+
+    medals = ["🥇", "🥈", "🥉"]
+    lines = []
+    for i, c in enumerate(cappers[:10]):
+        rank = medals[i] if i < 3 else f"**{i+1}.**"
+        u = c.get("units_pl", 0)
+        roi = c.get("roi_pct")
+        roi_s = f" · {roi:+.1f}% ROI" if isinstance(roi, (int, float)) else ""
+        lines.append(f"{rank} **{c.get('username','capper')}** — {u:+.2f}u ({c.get('record','0-0')}){roi_s}")
+
+    embed = discord.Embed(
+        title="🏆 Capper Leaderboard",
+        description="\n".join(lines),
+        color=BRAND_COLOR, timestamp=now_utc(),
+    )
+    leader = cappers[0]
+    embed.add_field(
+        name="Leader",
+        value=f"**{leader.get('username','capper')}** — {leader.get('units_pl',0):+.2f}u",
+        inline=False,
+    )
+    embed.add_field(name="Track your own", value="`/track [team]` • `/mystats`", inline=False)
+    embed.set_footer(text="Ranked by units won • Line Logic")
+    await channel.send(embed=embed)
+    await _sync_top_capper_role(leader.get("user_id"))
+    return True, "posted"
+
+
+@tasks.loop(time=dtime(hour=WEEKLY_POST_HOUR_UTC, minute=0, tzinfo=timezone.utc))
+async def weekly_capper_loop():
+    if not WEEKLY_POST_ENABLED:
+        return
+    if datetime.now(timezone.utc).weekday() != WEEKLY_POST_WEEKDAY:
+        return
+    try:
+        ok, reason = await post_capper_leaderboard()
+        if not ok:
+            log.warning("weekly leaderboard skipped: %s", reason)
+    except Exception:
+        log.exception("weekly leaderboard loop failed")
+
+
+@weekly_capper_loop.before_loop
+async def _before_weekly_capper():
+    await bot.wait_until_ready()
+
+
 # ---------- Slash commands ----------
 
 def _fmt_odds(v):
@@ -908,6 +1021,29 @@ async def mystats_command(interaction: discord.Interaction):
     embed.add_field(name="Units", value=f"{units:+.2f}u" if isinstance(units, (int, float)) else "—", inline=True)
     embed.add_field(name="ROI", value=f"{roi:+.1f}%" if isinstance(roi, (int, float)) else "—", inline=True)
     embed.add_field(name="Total Tracked", value=str(data.get("total", 0)), inline=True)
+
+    form = data.get("recent_form") or []
+    if form:
+        embed.add_field(
+            name="Recent Form",
+            value=" ".join("🟢" if x == "W" else "🔴" for x in form),
+            inline=False,
+        )
+
+    by_sport = data.get("by_sport") or {}
+    ranked = sorted(by_sport.items(), key=lambda kv: (kv[1].get("units_pl") or 0), reverse=True)
+    lines = []
+    for sp, s in ranked[:6]:
+        emoji, label, _ = SPORT_LABEL_MAP.get(sp, ("", sp.upper(), ""))
+        u = s.get("units_pl")
+        rec = s.get("record", "0-0")
+        pend = s.get("pending", 0)
+        if (s.get("wins", 0) + s.get("losses", 0)) > 0:
+            lines.append(f"{emoji} **{label}** — {rec} · {u:+.2f}u")
+        elif pend:
+            lines.append(f"{emoji} **{label}** — {pend} pending")
+    if lines:
+        embed.add_field(name="By Sport", value="\n".join(lines), inline=False)
     embed.set_footer(text="Line Logic • track picks with /track")
     await interaction.followup.send(embed=embed)
 
@@ -975,6 +1111,20 @@ async def postdaily_command(interaction: discord.Interaction):
     ok, reason = await post_daily_card()
     await interaction.followup.send(
         "Posted the daily card." if ok else f"Couldn't post — {reason}",
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(name="postcappers", description="(Staff) Post the capper leaderboard now")
+async def postcappers_command(interaction: discord.Interaction):
+    perms = getattr(interaction.user, "guild_permissions", None)
+    if not perms or not (perms.manage_guild or perms.administrator):
+        await interaction.response.send_message("That's a staff-only command.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    ok, reason = await post_capper_leaderboard()
+    await interaction.followup.send(
+        "Posted the capper leaderboard." if ok else f"Couldn't post — {reason}",
         ephemeral=True,
     )
 
@@ -1125,6 +1275,10 @@ async def on_ready():
     if DAILY_POST_ENABLED and not daily_post_loop.is_running():
         daily_post_loop.start()
         log.info("Daily post scheduled for %02d:00 UTC", DAILY_POST_HOUR_UTC)
+    if WEEKLY_POST_ENABLED and not weekly_capper_loop.is_running():
+        weekly_capper_loop.start()
+        log.info("Weekly capper leaderboard scheduled for %02d:00 UTC (weekday %d)",
+                 WEEKLY_POST_HOUR_UTC, WEEKLY_POST_WEEKDAY)
 
 
 async def bot_log(message: str):
