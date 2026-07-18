@@ -55,6 +55,7 @@ NOTIFY_ROLE_IDS = {
     "ufc": int(os.environ.get("ROLE_UFC_ALERTS", "0")),
     "stocks": int(os.environ.get("ROLE_STOCK_ALERTS", "0")),
     "line_movement": int(os.environ.get("ROLE_LINE_MOVEMENT_ALERTS", "0")),
+    "ladder": int(os.environ.get("ROLE_LADDER_ALERTS", "0")),
 }
 
 BRAND_COLOR = int(os.environ.get("BRAND_COLOR_HEX", "2B6CB0"), 16)
@@ -370,6 +371,120 @@ async def weekly_capper_loop():
 
 @weekly_capper_loop.before_loop
 async def _before_weekly_capper():
+    await bot.wait_until_ready()
+
+
+# ---------- Ladder Challenge daily post ----------
+
+LADDER_POST_ENABLED = os.environ.get("LADDER_POST_ENABLED", "1") == "1"
+LADDER_POST_HOUR_UTC = int(os.environ.get("LADDER_POST_HOUR_UTC", "15"))
+LADDER_CHANNEL_ID = int(os.environ.get("CHANNEL_LADDER", "0"))
+
+
+async def build_ladder_embed():
+    """Returns (embed, mention) for the Ladder Challenge, or (None, None)."""
+    async with aiohttp.ClientSession() as session:
+        try:
+            data = await fetch_json(session, "/api/ladder/status",
+                                    params={"history": 5}, timeout=25)
+        except Exception:
+            log.exception("ladder status fetch failed")
+            return None, None
+
+    st = data.get("state") or {}
+    leg = data.get("current_leg") or {}
+    hist = data.get("history") or []
+
+    rung = st.get("rung", 1)
+    bankroll = st.get("bankroll", 0)
+    attempt = st.get("attempt", 1)
+
+    embed = discord.Embed(
+        title="🪜 The Ladder Challenge",
+        description=(f"**Rung {rung} of 10** · Bankroll **${bankroll:,.2f}** · Run #{attempt}\n"
+                     "Roll a $10 bankroll through 10 straight winners. One loss resets to rung 1."),
+        color=BRAND_COLOR,
+        timestamp=now_utc(),
+    )
+
+    if leg:
+        odds_s = _fmt_odds(leg.get("odds"))
+        edge = leg.get("edge_pct")
+        edge_s = f" • Edge: **+{edge:.1f}%**" if isinstance(edge, (int, float)) else ""
+        embed.add_field(
+            name=f"Today's Leg — Rung {leg.get('rung', rung)}",
+            value=(f"**{leg.get('pick','—')}** ({str(leg.get('sport','')).upper()})\n"
+                   f"Risk **${leg.get('stake',0):,.2f}** at {odds_s} "
+                   f"to return **${leg.get('to_return',0):,.2f}**{edge_s}"),
+            inline=False,
+        )
+    else:
+        embed.add_field(
+            name="Today's Leg",
+            value="Not posted yet — check back once the model locks today's pick.",
+            inline=False,
+        )
+
+    if hist:
+        marks = []
+        for h in hist[:5]:
+            r = (h.get("result") or "").lower()
+            marks.append("🟢" if r == "win" else "🔴" if r == "loss" else "⚪")
+        embed.add_field(name="Last 5 legs", value=" ".join(marks), inline=True)
+
+    best_r = st.get("best_rung_ever")
+    if best_r:
+        embed.add_field(
+            name="Best run",
+            value=f"Rung {best_r} · ${st.get('best_bankroll_ever', 0):,.2f}",
+            inline=True,
+        )
+    if st.get("completed_runs"):
+        embed.add_field(name="Completed runs", value=str(st["completed_runs"]), inline=True)
+
+    embed.set_footer(text="One bet at a time • not a guarantee • thelinelogic.com")
+
+    # The ladder has its own opt-in role so it doesn't double-ping sport followers
+    mention = role_mention("ladder")
+    return embed, mention
+
+
+async def post_ladder_card() -> tuple[bool, str]:
+    channel_id = LADDER_CHANNEL_ID or CHANNEL_IDS.get("daily_model")
+    if not channel_id:
+        return False, "No channel set (CHANNEL_LADDER or CHANNEL_DAILY_MODEL)."
+    channel = bot.get_channel(channel_id)
+    if channel is None:
+        try:
+            channel = await bot.fetch_channel(channel_id)
+        except Exception as e:
+            return False, f"Couldn't load channel `{channel_id}`: {e}"
+    embed, mention = await build_ladder_embed()
+    if embed is None:
+        return False, "Couldn't reach the ladder status endpoint."
+    try:
+        await channel.send(content=mention or None, embed=embed)
+    except discord.Forbidden:
+        return False, f"Can't post in <#{channel_id}> — needs Send Messages + Embed Links."
+    except Exception as e:
+        return False, f"Send failed: {e}"
+    return True, "posted"
+
+
+@tasks.loop(time=dtime(hour=LADDER_POST_HOUR_UTC, minute=10, tzinfo=timezone.utc))
+async def ladder_post_loop():
+    if not LADDER_POST_ENABLED:
+        return
+    try:
+        ok, reason = await post_ladder_card()
+        if not ok:
+            log.warning("ladder post skipped: %s", reason)
+    except Exception:
+        log.exception("ladder post loop failed")
+
+
+@ladder_post_loop.before_loop
+async def _before_ladder_post():
     await bot.wait_until_ready()
 
 
@@ -1115,6 +1230,28 @@ async def postdaily_command(interaction: discord.Interaction):
     )
 
 
+@bot.tree.command(name="ladder", description="The Ladder Challenge — current rung, bankroll, and today's leg")
+async def ladder_command(interaction: discord.Interaction):
+    await interaction.response.defer()
+    embed, _ = await build_ladder_embed()
+    if embed is None:
+        await interaction.followup.send("Couldn't reach the ladder right now — try again shortly.")
+        return
+    await interaction.followup.send(embed=embed)
+
+
+@bot.tree.command(name="postladder", description="(Staff) Post the Ladder Challenge card now")
+async def postladder_command(interaction: discord.Interaction):
+    perms = getattr(interaction.user, "guild_permissions", None)
+    if not perms or not (perms.manage_guild or perms.administrator):
+        await interaction.response.send_message("That's a staff-only command.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    ok, reason = await post_ladder_card()
+    await interaction.followup.send(
+        "Posted the ladder card." if ok else f"Couldn't post — {reason}", ephemeral=True)
+
+
 @bot.tree.command(name="postcappers", description="(Staff) Post the capper leaderboard now")
 async def postcappers_command(interaction: discord.Interaction):
     perms = getattr(interaction.user, "guild_permissions", None)
@@ -1275,6 +1412,9 @@ async def on_ready():
     if DAILY_POST_ENABLED and not daily_post_loop.is_running():
         daily_post_loop.start()
         log.info("Daily post scheduled for %02d:00 UTC", DAILY_POST_HOUR_UTC)
+    if LADDER_POST_ENABLED and not ladder_post_loop.is_running():
+        ladder_post_loop.start()
+        log.info("Ladder post scheduled for %02d:10 UTC", LADDER_POST_HOUR_UTC)
     if WEEKLY_POST_ENABLED and not weekly_capper_loop.is_running():
         weekly_capper_loop.start()
         log.info("Weekly capper leaderboard scheduled for %02d:00 UTC (weekday %d)",
