@@ -602,6 +602,14 @@ async def _before_results_post():
 EDGE_ALERTS_ENABLED = os.environ.get("EDGE_ALERTS_ENABLED", "1") == "1"
 EDGE_ALERT_MIN = float(os.environ.get("EDGE_ALERT_MIN", "6"))       # % edge to fire
 EDGE_ALERT_INTERVAL_MIN = int(os.environ.get("EDGE_ALERT_INTERVAL_MIN", "90"))
+# Low-tier tennis (ITF futures, Challengers) has thin, stale lines — big "edges"
+# there are usually data noise rather than real value, and most books barely
+# offer them. Excluded from alerts by default; override with EDGE_EXCLUDE_TIERS.
+EDGE_EXCLUDE_TIERS = {
+    t.strip().upper()
+    for t in os.environ.get("EDGE_EXCLUDE_TIERS", "ITF,CHALLENGER").split(",")
+    if t.strip()
+}
 _edge_seen: dict[str, set] = {}
 
 
@@ -634,11 +642,16 @@ async def scan_edge_alerts() -> int:
             _edge_seen.pop(k, None)
 
     posted = 0
+    skipped_tier = 0
     for p in (data.get("picks") or []):
         edge = p.get("edge_pct")
         if not isinstance(edge, (int, float)) or edge < EDGE_ALERT_MIN:
             continue
         if p.get("market_odds") is None:
+            continue
+        tier = str(p.get("tier") or "").strip().upper()
+        if tier and tier in EDGE_EXCLUDE_TIERS:
+            skipped_tier += 1
             continue
         key = _edge_key(p)
         if key in seen:
@@ -665,8 +678,11 @@ async def scan_edge_alerts() -> int:
             await asyncio.sleep(1)
         except Exception:
             log.warning("edge alert send failed", exc_info=True)
-    if posted:
-        await bot_log(f"Posted {posted} edge alert(s).")
+    if posted or skipped_tier:
+        note = f"Posted {posted} edge alert(s)."
+        if skipped_tier:
+            note += f" Skipped {skipped_tier} low-tier tennis play(s)."
+        await bot_log(note)
     return posted
 
 
