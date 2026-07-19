@@ -35,6 +35,8 @@ WELCOME_CHANNEL_ID = int(os.environ.get("CHANNEL_WELCOME", "0"))
 BOT_LOGS_CHANNEL_ID = int(os.environ.get("CHANNEL_BOT_LOGS", "0"))
 VERIFIED_ROLE_ID = int(os.environ.get("VERIFIED_ROLE_ID", "0"))
 TICKETS_CHANNEL_ID = int(os.environ.get("CHANNEL_TICKETS", "0"))
+EDGE_ALERTS_CHANNEL_ID = int(os.environ.get("CHANNEL_EDGE_ALERTS", "0"))
+WEBSITE_UPDATES_CHANNEL_ID = int(os.environ.get("CHANNEL_WEBSITE_UPDATES", "0"))
 OWNER_USER_ID = int(os.environ.get("OWNER_USER_ID", "0"))
 
 # AI explain layer. Dormant until your backend has the /api/explain route live
@@ -496,6 +498,190 @@ async def ladder_post_loop():
 
 @ladder_post_loop.before_loop
 async def _before_ladder_post():
+    await bot.wait_until_ready()
+
+
+# ---------- Official results recap ----------
+# PickResult stores game refs, not team names, so the recap is an honest
+# aggregate (record / units / ROI per sport) rather than a game-by-game list.
+
+RESULTS_POST_ENABLED = os.environ.get("RESULTS_POST_ENABLED", "1") == "1"
+RESULTS_POST_HOUR_UTC = int(os.environ.get("RESULTS_POST_HOUR_UTC", "14"))  # ~9am CT
+
+
+async def build_results_embed(days: int = 1):
+    async with aiohttp.ClientSession() as session:
+        try:
+            data = await fetch_json(session, "/api/accuracy",
+                                    params={"days": days}, timeout=25)
+        except Exception:
+            log.exception("results recap fetch failed")
+            return None
+
+    ov = data.get("overall", {}) or {}
+    by_sport = data.get("by_sport", {}) or {}
+    units = ov.get("units_30d")
+    roi = ov.get("roi_30d")
+    priced = ov.get("priced_30d", 0)
+
+    window = "Yesterday" if days == 1 else f"Last {days} days"
+    embed = discord.Embed(
+        title=f"📊 Official Results — {window}",
+        description=("Every graded pick, win or lose. Units count only recommended "
+                     "+EV wagers.\n\n"
+                     + (f"**{units:+.2f}u** on {priced} graded wager(s)"
+                        + (f" · **{roi:+.1f}% ROI**" if isinstance(roi, (int, float)) else "")
+                        if isinstance(units, (int, float)) and priced
+                        else "No priced wagers settled in this window.")),
+        color=BRAND_COLOR, timestamp=now_utc(),
+    )
+
+    lines = []
+    for sp, s in sorted(by_sport.items(),
+                        key=lambda kv: (kv[1].get("units_30d") or 0), reverse=True):
+        emoji, label, _ = SPORT_LABEL_MAP.get(sp, ("", sp.upper(), ""))
+        u = s.get("units_30d")
+        n = s.get("priced_30d", 0)
+        if n and isinstance(u, (int, float)):
+            lines.append(f"{emoji} **{label}** — {u:+.2f}u on {n} wager(s)")
+    if lines:
+        embed.add_field(name="By sport", value="\n".join(lines[:8]), inline=False)
+
+    at_w, at_l = ov.get("alltime_wins", 0), ov.get("alltime_losses", 0)
+    if at_w or at_l:
+        embed.add_field(
+            name="All-time",
+            value=f"{at_w}-{at_l} ({ov.get('alltime_pct','—')}%)",
+            inline=False,
+        )
+    embed.set_footer(text="Full track record • thelinelogic.com")
+    return embed
+
+
+async def post_results_recap() -> tuple[bool, str]:
+    channel_id = CHANNEL_IDS.get("official_results")
+    if not channel_id:
+        return False, "CHANNEL_OFFICIAL_RESULTS isn't set."
+    channel = bot.get_channel(channel_id)
+    if channel is None:
+        try:
+            channel = await bot.fetch_channel(channel_id)
+        except Exception as e:
+            return False, f"Couldn't load channel `{channel_id}`: {e}"
+    embed = await build_results_embed(1)
+    if embed is None:
+        return False, "Couldn't reach the results endpoint."
+    try:
+        await channel.send(embed=embed)
+    except discord.Forbidden:
+        return False, f"Can't post in <#{channel_id}> — needs Send Messages + Embed Links."
+    return True, "posted"
+
+
+@tasks.loop(time=dtime(hour=RESULTS_POST_HOUR_UTC, minute=0, tzinfo=timezone.utc))
+async def results_post_loop():
+    if not RESULTS_POST_ENABLED:
+        return
+    try:
+        ok, reason = await post_results_recap()
+        if not ok:
+            log.warning("results recap skipped: %s", reason)
+    except Exception:
+        log.exception("results recap loop failed")
+
+
+@results_post_loop.before_loop
+async def _before_results_post():
+    await bot.wait_until_ready()
+
+
+# ---------- Edge alerts ----------
+# Scans the board periodically and posts NEW plays above a threshold, pinging
+# that sport's role. Dedupes in memory so the same play isn't posted twice a day.
+
+EDGE_ALERTS_ENABLED = os.environ.get("EDGE_ALERTS_ENABLED", "1") == "1"
+EDGE_ALERT_MIN = float(os.environ.get("EDGE_ALERT_MIN", "6"))       # % edge to fire
+EDGE_ALERT_INTERVAL_MIN = int(os.environ.get("EDGE_ALERT_INTERVAL_MIN", "90"))
+_edge_seen: dict[str, set] = {}
+
+
+def _edge_key(p) -> str:
+    return f"{p.get('sport')}|{p.get('match')}|{p.get('pick')}"
+
+
+async def scan_edge_alerts() -> int:
+    """Post any qualifying plays we haven't already alerted on today."""
+    if not EDGE_ALERTS_CHANNEL_ID:
+        return 0
+    channel = bot.get_channel(EDGE_ALERTS_CHANNEL_ID)
+    if channel is None:
+        try:
+            channel = await bot.fetch_channel(EDGE_ALERTS_CHANNEL_ID)
+        except Exception:
+            return 0
+
+    async with aiohttp.ClientSession() as session:
+        try:
+            data = await fetch_json(session, "/api/picks/quick", timeout=25)
+        except Exception:
+            log.warning("edge alert scan: board fetch failed")
+            return 0
+
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    seen = _edge_seen.setdefault(today, set())
+    for k in list(_edge_seen.keys()):   # drop previous days so the dict stays small
+        if k != today:
+            _edge_seen.pop(k, None)
+
+    posted = 0
+    for p in (data.get("picks") or []):
+        edge = p.get("edge_pct")
+        if not isinstance(edge, (int, float)) or edge < EDGE_ALERT_MIN:
+            continue
+        if p.get("market_odds") is None:
+            continue
+        key = _edge_key(p)
+        if key in seen:
+            continue
+        prob_pct = round((p.get("prob") or 0) * 100)
+        embed = discord.Embed(
+            title=f"⚡ Edge Alert — {p.get('pick','—')}",
+            description=p.get("match", ""),
+            color=0x2ECC71, timestamp=now_utc(),
+        )
+        embed.add_field(name="Sport", value=str(p.get("sport", "")).upper(), inline=True)
+        embed.add_field(name="Model", value=f"{prob_pct}%", inline=True)
+        embed.add_field(name="Market", value=_fmt_odds(p.get("market_odds")), inline=True)
+        embed.add_field(name="Fair", value=_fmt_odds(p.get("fair_odds")), inline=True)
+        embed.add_field(name="Edge", value=f"**+{edge:.1f}%**", inline=True)
+        if p.get("event_time"):
+            embed.add_field(name="Start", value=str(p["event_time"]), inline=True)
+        embed.set_footer(text="Value play, not a guarantee • thelinelogic.com")
+        mention = role_mention(str(p.get("sport", "")).lower())
+        try:
+            await channel.send(content=mention or None, embed=embed)
+            seen.add(key)
+            posted += 1
+            await asyncio.sleep(1)
+        except Exception:
+            log.warning("edge alert send failed", exc_info=True)
+    if posted:
+        await bot_log(f"Posted {posted} edge alert(s).")
+    return posted
+
+
+@tasks.loop(minutes=EDGE_ALERT_INTERVAL_MIN)
+async def edge_alert_loop():
+    if not EDGE_ALERTS_ENABLED:
+        return
+    try:
+        await scan_edge_alerts()
+    except Exception:
+        log.exception("edge alert loop failed")
+
+
+@edge_alert_loop.before_loop
+async def _before_edge_alerts():
     await bot.wait_until_ready()
 
 
@@ -1421,6 +1607,69 @@ class TicketPanel(discord.ui.View):
         await interaction.response.send_modal(TicketModal("other"))
 
 
+@bot.tree.command(name="announce", description="(Staff) Post a website/product update to #website-updates")
+@app_commands.describe(title="Headline for the update", body="What changed and why it matters",
+                       ping="Ping @everyone? Use sparingly — big releases only")
+async def announce_command(interaction: discord.Interaction, title: str, body: str,
+                           ping: bool = False):
+    perms = getattr(interaction.user, "guild_permissions", None)
+    if not perms or not (perms.manage_guild or perms.administrator):
+        await interaction.response.send_message("That's a staff-only command.", ephemeral=True)
+        return
+    if not WEBSITE_UPDATES_CHANNEL_ID:
+        await interaction.response.send_message(
+            "CHANNEL_WEBSITE_UPDATES isn't set.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    channel = bot.get_channel(WEBSITE_UPDATES_CHANNEL_ID)
+    if channel is None:
+        try:
+            channel = await bot.fetch_channel(WEBSITE_UPDATES_CHANNEL_ID)
+        except Exception as e:
+            await interaction.followup.send(f"Couldn't load the channel: {e}", ephemeral=True)
+            return
+    embed = discord.Embed(
+        title=f"🚀 {title[:240]}",
+        description=body[:3800].replace("\\n", "\n"),
+        color=BRAND_COLOR, timestamp=now_utc(),
+    )
+    embed.set_footer(text="Line Logic • thelinelogic.com")
+    try:
+        await channel.send(content="@everyone" if ping else None, embed=embed)
+    except discord.Forbidden:
+        await interaction.followup.send("Can\'t post there — check LineBot\'s permissions.", ephemeral=True)
+        return
+    await interaction.followup.send("Update posted.", ephemeral=True)
+
+
+@bot.tree.command(name="postresults", description="(Staff) Post the results recap now")
+async def postresults_command(interaction: discord.Interaction):
+    perms = getattr(interaction.user, "guild_permissions", None)
+    if not perms or not (perms.manage_guild or perms.administrator):
+        await interaction.response.send_message("That's a staff-only command.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    ok, reason = await post_results_recap()
+    await interaction.followup.send(
+        "Posted the results recap." if ok else f"Couldn't post — {reason}", ephemeral=True)
+
+
+@bot.tree.command(name="scanedges", description="(Staff) Scan the board and post any new edge alerts")
+async def scanedges_command(interaction: discord.Interaction):
+    perms = getattr(interaction.user, "guild_permissions", None)
+    if not perms or not (perms.manage_guild or perms.administrator):
+        await interaction.response.send_message("That's a staff-only command.", ephemeral=True)
+        return
+    if not EDGE_ALERTS_CHANNEL_ID:
+        await interaction.response.send_message("CHANNEL_EDGE_ALERTS isn't set.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    n = await scan_edge_alerts()
+    await interaction.followup.send(
+        f"Posted {n} edge alert(s)." if n else
+        f"No new plays at or above +{EDGE_ALERT_MIN:.0f}% edge right now.", ephemeral=True)
+
+
 @bot.tree.command(name="ticketpanel", description="(Staff) Post the ticket button panel in this channel")
 async def ticketpanel_command(interaction: discord.Interaction):
     perms = getattr(interaction.user, "guild_permissions", None)
@@ -1754,6 +2003,12 @@ async def on_ready():
     if DAILY_POST_ENABLED and not daily_post_loop.is_running():
         daily_post_loop.start()
         log.info("Daily post scheduled for %02d:00 UTC", DAILY_POST_HOUR_UTC)
+    if RESULTS_POST_ENABLED and not results_post_loop.is_running():
+        results_post_loop.start()
+        log.info("Results recap scheduled for %02d:00 UTC", RESULTS_POST_HOUR_UTC)
+    if EDGE_ALERTS_ENABLED and EDGE_ALERTS_CHANNEL_ID and not edge_alert_loop.is_running():
+        edge_alert_loop.start()
+        log.info("Edge alerts every %d min (min edge %.1f%%)", EDGE_ALERT_INTERVAL_MIN, EDGE_ALERT_MIN)
     if LADDER_POST_ENABLED and not ladder_post_loop.is_running():
         ladder_post_loop.start()
         log.info("Ladder post scheduled for %02d:10 UTC", LADDER_POST_HOUR_UTC)
