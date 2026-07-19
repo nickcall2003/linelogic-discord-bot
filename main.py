@@ -510,50 +510,82 @@ RESULTS_POST_HOUR_UTC = int(os.environ.get("RESULTS_POST_HOUR_UTC", "14"))  # ~9
 
 
 async def build_results_embed(days: int = 1):
+    """Two-part results post: yesterday's settled slate, plus the running
+    all-time track record so the feed always shows where the model stands."""
     async with aiohttp.ClientSession() as session:
         try:
-            data = await fetch_json(session, "/api/accuracy",
-                                    params={"days": days}, timeout=25)
+            day = await fetch_json(session, "/api/accuracy", params={"days": days}, timeout=25)
         except Exception:
             log.exception("results recap fetch failed")
             return None
+        # all-time units need a wide window (units are always windowed)
+        alltime = {}
+        try:
+            alltime = await fetch_json(session, "/api/accuracy",
+                                       params={"days": 36500}, timeout=30)
+        except Exception:
+            log.warning("all-time accuracy fetch failed; showing window only")
 
-    ov = data.get("overall", {}) or {}
-    by_sport = data.get("by_sport", {}) or {}
-    units = ov.get("units_30d")
-    roi = ov.get("roi_30d")
-    priced = ov.get("priced_30d", 0)
+    ov = day.get("overall", {}) or {}
+    av = (alltime.get("overall", {}) or {}) if alltime else {}
 
-    window = "Yesterday" if days == 1 else f"Last {days} days"
+    window_label = "Yesterday" if days == 1 else f"Last {days} days"
     embed = discord.Embed(
-        title=f"📊 Official Results — {window}",
-        description=("Every graded pick, win or lose. Units count only recommended "
-                     "+EV wagers.\n\n"
-                     + (f"**{units:+.2f}u** on {priced} graded wager(s)"
-                        + (f" · **{roi:+.1f}% ROI**" if isinstance(roi, (int, float)) else "")
-                        if isinstance(units, (int, float)) and priced
-                        else "No priced wagers settled in this window.")),
+        title="📊 Official Results",
+        description="Every graded pick, win or lose. Units count only recommended +EV wagers.",
         color=BRAND_COLOR, timestamp=now_utc(),
     )
 
-    lines = []
-    for sp, s in sorted(by_sport.items(),
-                        key=lambda kv: (kv[1].get("units_30d") or 0), reverse=True):
-        emoji, label, _ = SPORT_LABEL_MAP.get(sp, ("", sp.upper(), ""))
-        u = s.get("units_30d")
-        n = s.get("priced_30d", 0)
-        if n and isinstance(u, (int, float)):
-            lines.append(f"{emoji} **{label}** — {u:+.2f}u on {n} wager(s)")
-    if lines:
-        embed.add_field(name="By sport", value="\n".join(lines[:8]), inline=False)
+    # --- window (yesterday) ---
+    w_w = ov.get("wins_30d", 0)
+    w_l = ov.get("losses_30d", 0)
+    w_u = ov.get("units_30d")
+    w_roi = ov.get("roi_30d")
+    w_n = ov.get("priced_30d", 0)
+    w_pct = round(100 * w_w / (w_w + w_l), 1) if (w_w + w_l) else None
+    if (w_w + w_l) or w_n:
+        val = f"**{w_w}-{w_l}**" + (f" ({w_pct}%)" if w_pct is not None else "")
+        if isinstance(w_u, (int, float)) and w_n:
+            val += f"\n**{w_u:+.2f}u** on {w_n} wager(s)"
+            if isinstance(w_roi, (int, float)):
+                val += f" · {w_roi:+.1f}% ROI"
+    else:
+        val = "Nothing settled in this window."
+    embed.add_field(name=f"🗓️ {window_label}", value=val, inline=False)
 
-    at_w, at_l = ov.get("alltime_wins", 0), ov.get("alltime_losses", 0)
+    # --- all-time running record ---
+    at_w = ov.get("alltime_wins", 0)
+    at_l = ov.get("alltime_losses", 0)
+    at_pct = ov.get("alltime_pct")
+    at_u = av.get("units_30d")
+    at_roi = av.get("roi_30d")
+    at_n = av.get("priced_30d", 0)
     if at_w or at_l:
-        embed.add_field(
-            name="All-time",
-            value=f"{at_w}-{at_l} ({ov.get('alltime_pct','—')}%)",
-            inline=False,
-        )
+        val = f"**{at_w}-{at_l}**" + (f" ({at_pct}%)" if at_pct is not None else "")
+        if isinstance(at_u, (int, float)) and at_n:
+            val += f"\n**{at_u:+.2f}u** on {at_n} graded wager(s)"
+            if isinstance(at_roi, (int, float)):
+                val += f" · {at_roi:+.1f}% ROI"
+        embed.add_field(name="📈 All-Time", value=val, inline=False)
+
+    # --- per-sport for the window ---
+    lines = []
+    for sp, sdata in sorted((day.get("by_sport", {}) or {}).items(),
+                            key=lambda kv: (kv[1].get("units_30d") or 0), reverse=True):
+        emoji, label, _ = SPORT_LABEL_MAP.get(sp, ("", sp.upper(), ""))
+        u = sdata.get("units_30d")
+        n = sdata.get("priced_30d", 0)
+        sw, sl = sdata.get("wins_30d", 0), sdata.get("losses_30d", 0)
+        if (sw + sl) == 0 and not n:
+            continue
+        line = f"{emoji} **{label}** — {sw}-{sl}"
+        if n and isinstance(u, (int, float)):
+            line += f" · {u:+.2f}u"
+        lines.append(line)
+    if lines:
+        embed.add_field(name=f"By sport ({window_label.lower()})",
+                        value="\n".join(lines[:8]), inline=False)
+
     embed.set_footer(text="Full track record • thelinelogic.com")
     return embed
 
