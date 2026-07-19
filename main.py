@@ -352,6 +352,13 @@ async def post_capper_leaderboard() -> tuple[bool, str]:
     embed.add_field(name="Track your own", value="`/track [team]` • `/mystats`", inline=False)
     embed.set_footer(text="Ranked by units won • Line Logic")
     await channel.send(embed=embed)
+    # the room's combined record posts alongside the individual leaderboard
+    room = await build_room_embed(7)
+    if room is not None:
+        try:
+            await channel.send(embed=room)
+        except Exception:
+            log.warning("room embed send failed")
     await _sync_top_capper_role(leader.get("user_id"))
     return True, "posted"
 
@@ -1230,6 +1237,74 @@ async def postdaily_command(interaction: discord.Interaction):
         "Posted the daily card." if ok else f"Couldn't post — {reason}",
         ephemeral=True,
     )
+
+
+async def build_room_embed(days: int = 7):
+    """The community's combined record — every tracked pick as one capper."""
+    async with aiohttp.ClientSession() as session:
+        try:
+            data = await fetch_json(session, "/api/capper/community",
+                                    params={"days": days}, timeout=25)
+        except Exception:
+            log.exception("room record fetch failed")
+            return None
+
+    if not data.get("total"):
+        return discord.Embed(
+            title="🏟️ The Room",
+            description=("No tracked picks in this window yet. Use `/track [team]` "
+                         "and the room's record starts building."),
+            color=BRAND_COLOR, timestamp=now_utc(),
+        )
+
+    units = data.get("units_pl")
+    roi = data.get("roi_pct")
+    win_pct = data.get("win_pct")
+    window = f"last {days} days" if days else "all time"
+
+    embed = discord.Embed(
+        title="🏟️ The Room — Community Record",
+        description=(f"Every pick tracked in this server, combined ({window}).\n"
+                     f"**{data.get('cappers', 0)}** capper(s) · "
+                     f"**{data.get('total', 0)}** picks tracked"),
+        color=BRAND_COLOR, timestamp=now_utc(),
+    )
+    embed.add_field(name="Record", value=data.get("record", "0-0"), inline=True)
+    embed.add_field(name="Win %", value=f"{win_pct}%" if win_pct is not None else "—", inline=True)
+    embed.add_field(name="Pending", value=str(data.get("pending", 0)), inline=True)
+    embed.add_field(name="Units", value=f"{units:+.2f}u" if isinstance(units, (int, float)) else "—", inline=True)
+    embed.add_field(name="ROI", value=f"{roi:+.1f}%" if isinstance(roi, (int, float)) else "—", inline=True)
+
+    by_sport = data.get("by_sport") or {}
+    ranked = sorted(by_sport.items(), key=lambda kv: (kv[1].get("units_pl") or 0), reverse=True)
+    lines = []
+    for sp, s in ranked[:5]:
+        emoji, label, _ = SPORT_LABEL_MAP.get(sp, ("", sp.upper(), ""))
+        if (s.get("wins", 0) + s.get("losses", 0)) > 0:
+            lines.append(f"{emoji} **{label}** — {s.get('record','0-0')} · {s.get('units_pl',0):+.2f}u")
+    if lines:
+        embed.add_field(name="Where the room is winning", value="\n".join(lines), inline=False)
+
+    hot = data.get("hot_picks") or []
+    if hot:
+        embed.add_field(
+            name="🔥 Most tracked right now",
+            value="\n".join(f"**{h['pick']}** — {h['count']} cappers" for h in hot[:3]),
+            inline=False,
+        )
+    embed.set_footer(text="Track your plays with /track • Line Logic")
+    return embed
+
+
+@bot.tree.command(name="room", description="The community's combined record — every tracked pick together")
+@app_commands.describe(days="Window in days (0 = all time, default 7)")
+async def room_command(interaction: discord.Interaction, days: int = 7):
+    await interaction.response.defer()
+    embed = await build_room_embed(max(0, min(days, 365)))
+    if embed is None:
+        await interaction.followup.send("Couldn't pull the room record right now — try again shortly.")
+        return
+    await interaction.followup.send(embed=embed)
 
 
 @bot.tree.command(name="permcheck", description="(Staff) Show what LineBot can actually do in a channel")
