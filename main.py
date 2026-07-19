@@ -34,6 +34,8 @@ CHANNEL_IDS = {
 WELCOME_CHANNEL_ID = int(os.environ.get("CHANNEL_WELCOME", "0"))
 BOT_LOGS_CHANNEL_ID = int(os.environ.get("CHANNEL_BOT_LOGS", "0"))
 VERIFIED_ROLE_ID = int(os.environ.get("VERIFIED_ROLE_ID", "0"))
+TICKETS_CHANNEL_ID = int(os.environ.get("CHANNEL_TICKETS", "0"))
+OWNER_USER_ID = int(os.environ.get("OWNER_USER_ID", "0"))
 
 # AI explain layer. Dormant until your backend has the /api/explain route live
 # (which is where the LLM key lives — the bot never calls an LLM directly, it just
@@ -1296,6 +1298,164 @@ async def build_room_embed(days: int = 7):
     return embed
 
 
+TICKET_KINDS = {
+    "suggestion": ("💡", "Suggestion"),
+    "bug": ("🐛", "Bug / something broken"),
+    "report": ("🚨", "Report a member"),
+    "other": ("📩", "Other"),
+}
+
+
+async def _create_ticket(interaction: discord.Interaction, kind: str,
+                         subject: str, details: str):
+    """Shared ticket creation — used by both the button panel and /ticket."""
+    emoji, label = TICKET_KINDS.get(kind, ("📩", "Ticket"))
+    kind_label = f"{emoji} {label}"
+
+    if not TICKETS_CHANNEL_ID:
+        await interaction.followup.send(
+            "Tickets aren't set up yet — staff need to set CHANNEL_TICKETS.", ephemeral=True)
+        return
+    channel = bot.get_channel(TICKETS_CHANNEL_ID)
+    if channel is None:
+        try:
+            channel = await bot.fetch_channel(TICKETS_CHANNEL_ID)
+        except Exception as e:
+            await interaction.followup.send(f"Couldn't open the ticket channel: {e}", ephemeral=True)
+            return
+
+    embed = discord.Embed(
+        title=f"{kind_label} — {subject[:200]}",
+        description=details[:3500],
+        color=BRAND_COLOR,
+        timestamp=now_utc(),
+    )
+    embed.set_author(name=str(interaction.user),
+                     icon_url=getattr(interaction.user.display_avatar, "url", None))
+    embed.set_footer(text=f"User ID: {interaction.user.id}")
+
+    try:
+        msg = await channel.send(embed=embed)
+    except discord.Forbidden:
+        await interaction.followup.send(
+            "I can't post in the ticket channel — staff need to give LineBot access there.",
+            ephemeral=True)
+        return
+
+    thread = None
+    try:
+        thread = await msg.create_thread(name=f"{kind}-{interaction.user.name}"[:90],
+                                         auto_archive_duration=10080)
+        await thread.add_user(interaction.user)
+        await thread.send(
+            f"{interaction.user.mention} thanks — staff will pick this up here. "
+            "Add anything else you think helps.")
+    except Exception:
+        log.warning("ticket thread creation failed", exc_info=True)
+
+    if OWNER_USER_ID:
+        try:
+            owner = bot.get_user(OWNER_USER_ID) or await bot.fetch_user(OWNER_USER_ID)
+            link = (thread.jump_url if thread else msg.jump_url)
+            dm = discord.Embed(
+                title=f"{kind_label} from {interaction.user}",
+                description=f"**{subject[:200]}**\n\n{details[:1500]}",
+                color=BRAND_COLOR, timestamp=now_utc(),
+            )
+            dm.add_field(name="Open it", value=link, inline=False)
+            await owner.send(embed=dm)
+        except discord.Forbidden:
+            log.warning("ticket DM blocked — owner has DMs closed")
+        except Exception:
+            log.warning("ticket DM failed", exc_info=True)
+
+    await interaction.followup.send(
+        f"Ticket opened{' — ' + thread.mention if thread else ''}. Staff will follow up there.",
+        ephemeral=True)
+
+
+class TicketModal(discord.ui.Modal):
+    """The popup form the member fills in after clicking a button."""
+    def __init__(self, kind: str):
+        emoji, label = TICKET_KINDS.get(kind, ("📩", "Ticket"))
+        super().__init__(title=f"{label}"[:45])
+        self.kind = kind
+        self.subject = discord.ui.TextInput(
+            label="Subject", placeholder="One line — what's this about?", max_length=100)
+        self.details = discord.ui.TextInput(
+            label="Details", style=discord.TextStyle.paragraph,
+            placeholder="Tell us what's going on. Include anything that helps.",
+            max_length=1500)
+        self.add_item(self.subject)
+        self.add_item(self.details)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        await _create_ticket(interaction, self.kind,
+                             self.subject.value, self.details.value)
+
+
+class TicketPanel(discord.ui.View):
+    """Persistent button panel — survives bot restarts via fixed custom_ids."""
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="Suggestion", emoji="💡",
+                       style=discord.ButtonStyle.primary, custom_id="ll_ticket:suggestion")
+    async def _suggestion(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(TicketModal("suggestion"))
+
+    @discord.ui.button(label="Bug", emoji="🐛",
+                       style=discord.ButtonStyle.secondary, custom_id="ll_ticket:bug")
+    async def _bug(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(TicketModal("bug"))
+
+    @discord.ui.button(label="Report", emoji="🚨",
+                       style=discord.ButtonStyle.danger, custom_id="ll_ticket:report")
+    async def _report(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(TicketModal("report"))
+
+    @discord.ui.button(label="Other", emoji="📩",
+                       style=discord.ButtonStyle.secondary, custom_id="ll_ticket:other")
+    async def _other(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(TicketModal("other"))
+
+
+@bot.tree.command(name="ticketpanel", description="(Staff) Post the ticket button panel in this channel")
+async def ticketpanel_command(interaction: discord.Interaction):
+    perms = getattr(interaction.user, "guild_permissions", None)
+    if not perms or not (perms.manage_guild or perms.administrator):
+        await interaction.response.send_message("That's a staff-only command.", ephemeral=True)
+        return
+    embed = discord.Embed(
+        title="📩 Open a Ticket",
+        description=("Need something? Pick the option that fits and a short form will "
+                     "pop up. Your ticket is **private** — only you and staff can see it, "
+                     "and we'll reply in your own thread.\n\n"
+                     "💡 **Suggestion** — an idea to make the server or model better\n"
+                     "🐛 **Bug** — something broken on the site, bot, or Discord\n"
+                     "🚨 **Report** — a member issue that needs staff attention\n"
+                     "📩 **Other** — anything else"),
+        color=BRAND_COLOR,
+    )
+    embed.set_footer(text="Line Logic • we read every one")
+    await interaction.response.send_message(embed=embed, view=TicketPanel())
+
+
+@bot.tree.command(name="ticket", description="Open a private ticket with staff — suggestions, bugs, or issues")
+@app_commands.describe(subject="Short summary", details="What's going on?")
+@app_commands.choices(kind=[
+    app_commands.Choice(name="Suggestion", value="suggestion"),
+    app_commands.Choice(name="Bug / something broken", value="bug"),
+    app_commands.Choice(name="Report a member", value="report"),
+    app_commands.Choice(name="Other", value="other"),
+])
+async def ticket_command(interaction: discord.Interaction, subject: str, details: str,
+                         kind: app_commands.Choice[str] | None = None):
+    await interaction.response.defer(ephemeral=True)
+    await _create_ticket(interaction, kind.value if kind else "other", subject, details)
+
+
 @bot.tree.command(name="room", description="The community's combined record — every tracked pick together")
 @app_commands.describe(days="Window in days (0 = all time, default 7)")
 async def room_command(interaction: discord.Interaction, days: int = 7):
@@ -1583,6 +1743,11 @@ async def on_ready():
     guild = discord.Object(id=GUILD_ID)
     # Commands are defined globally; copy them into this guild so they register
     # instantly (guild syncs are immediate; pure-global syncs can take ~1 hour).
+    # Persistent ticket buttons keep working across restarts
+    try:
+        bot.add_view(TicketPanel())
+    except Exception:
+        log.warning("ticket panel view registration failed", exc_info=True)
     bot.tree.copy_global_to(guild=guild)
     synced = await bot.tree.sync(guild=guild)
     log.info("Logged in as %s. Synced %d commands to guild %s", bot.user, len(synced), GUILD_ID)
