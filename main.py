@@ -36,6 +36,25 @@ BOT_LOGS_CHANNEL_ID = int(os.environ.get("CHANNEL_BOT_LOGS", "0"))
 VERIFIED_ROLE_ID = int(os.environ.get("VERIFIED_ROLE_ID", "0"))
 TICKETS_CHANNEL_ID = int(os.environ.get("CHANNEL_TICKETS", "0"))
 EDGE_ALERTS_CHANNEL_ID = int(os.environ.get("CHANNEL_EDGE_ALERTS", "0"))
+SLIPS_CHANNEL_ID = int(os.environ.get("CHANNEL_SLIPS", "0"))
+# Personal lookups reply privately so they don't flood chat. Anything listed in
+# PUBLIC_COMMANDS replies visibly instead (comma-separated command names).
+PUBLIC_COMMANDS = {
+    c.strip().lower()
+    for c in os.environ.get("PUBLIC_COMMANDS", "today,record,room,cappers,ladder").split(",")
+    if c.strip()
+}
+
+
+def is_private(cmd: str) -> bool:
+    """True when this command should reply only to the person who ran it."""
+    return cmd.lower() not in PUBLIC_COMMANDS
+
+
+async def _reply(interaction, cmd: str, *args, **kwargs):
+    """followup.send that respects the public/private setting for this command."""
+    kwargs.setdefault("ephemeral", is_private(cmd))
+    return await interaction.followup.send(*args, **kwargs)
 WEBSITE_UPDATES_CHANNEL_ID = int(os.environ.get("CHANNEL_WEBSITE_UPDATES", "0"))
 OWNER_USER_ID = int(os.environ.get("OWNER_USER_ID", "0"))
 
@@ -150,11 +169,16 @@ async def build_daily_card():
             slate = await fetch_json(session, "/api/slate", timeout=25)
         except Exception:
             log.warning("daily card: slate fetch failed")
+        data = {}
         try:
-            data = await fetch_json(session, "/api/picks/quick", timeout=25)
+            data = await fetch_json(session, "/api/picks/quick", timeout=40)
         except Exception:
-            log.exception("daily card: picks fetch failed")
-            return None, None
+            # Board fetch failed (slow enrichment or backend hiccup). If we at
+            # least have the slate, still post something useful rather than
+            # skipping the day entirely.
+            log.warning("daily card: picks fetch failed; falling back to slate only")
+            if not slate:
+                return None, None
 
     picks = data.get("picks", []) or []
     edges = [p for p in picks
@@ -778,7 +802,7 @@ def _pick_embed(p: dict) -> discord.Embed:
 @app_commands.choices(sport=SPORT_CHOICES)
 async def model_command(interaction: discord.Interaction, name: str,
                         sport: app_commands.Choice[str] | None = None):
-    await interaction.response.defer()
+    await interaction.response.defer(ephemeral=is_private("model"))
     params = {"team": name}
     if sport:
         params["sport"] = sport.value
@@ -787,11 +811,11 @@ async def model_command(interaction: discord.Interaction, name: str,
             data = await fetch_json(session, "/api/model", params=params)
         except Exception:
             log.exception("model lookup failed for %s", name)
-            await interaction.followup.send("Couldn't reach the model right now — try again shortly.")
+            await _reply(interaction, "model", "Couldn't reach the model right now — try again shortly.")
             return
 
     if not data.get("found"):
-        await interaction.followup.send(
+        await _reply(interaction, "model", 
             f"No upcoming game found for **{name}** in the next few days. "
             f"Check the spelling, or see the full board at thelinelogic.com"
         )
@@ -831,7 +855,7 @@ async def model_command(interaction: discord.Interaction, name: str,
         embed.set_footer(text=f"Game {data['date']} • Line Logic Model • thelinelogic.com")
     else:
         embed.set_footer(text="Line Logic Model • thelinelogic.com")
-    await interaction.followup.send(embed=embed)
+    await _reply(interaction, "model", embed=embed)
 
 
 @bot.tree.command(name="today", description="Today's slate — how many games/matches are on the board per sport")
@@ -925,7 +949,7 @@ async def _games_for_sport(session, sport: str, ids_only: bool = False):
 async def prop_command(interaction: discord.Interaction,
                        sport: app_commands.Choice[str],
                        player: str = ""):
-    await interaction.response.defer()
+    await interaction.response.defer(ephemeral=is_private("prop"))
     sport_val = sport.value
     needle = player.lower().strip()
 
@@ -934,7 +958,7 @@ async def prop_command(interaction: discord.Interaction,
             games = await _games_for_sport(session, sport_val)
         except Exception:
             log.exception("prop: games fetch failed for %s", sport_val)
-            await interaction.followup.send(f"Couldn't load today's {sport_val.upper()} games.")
+            await _reply(interaction, "prop", f"Couldn't load today's {sport_val.upper()} games.")
             return
 
         # Only pull props for games that haven't finished (live/upcoming), and
@@ -943,7 +967,7 @@ async def prop_command(interaction: discord.Interaction,
                   ("final", "finished", "post", "completed", "closed")]
         active = active[:8]
         if not active:
-            await interaction.followup.send(f"No upcoming {sport_val.upper()} games with props right now.")
+            await _reply(interaction, "prop", f"No upcoming {sport_val.upper()} games with props right now.")
             return
 
         collected = []
@@ -975,7 +999,7 @@ async def prop_command(interaction: discord.Interaction,
     if not collected:
         msg = (f"No props with a model projection for **{player}** today."
                if needle else f"No {sport_val.upper()} props with a model edge on the board yet.")
-        await interaction.followup.send(msg)
+        await _reply(interaction, "prop", msg)
         return
 
     # Rank by absolute projection-vs-line gap — the model's strongest leans
@@ -1004,7 +1028,7 @@ async def prop_command(interaction: discord.Interaction,
             inline=False,
         )
     embed.set_footer(text="Model projections — not a guarantee. Line Logic • thelinelogic.com")
-    await interaction.followup.send(embed=embed)
+    await _reply(interaction, "prop", embed=embed)
 
 
 # ---------- AI explain layer ----------
@@ -1014,7 +1038,7 @@ async def prop_command(interaction: discord.Interaction,
 # three stay hidden until AI_EXPLAIN_ENABLED=1 and the backend route exists.
 
 async def _explain_disabled_notice(interaction: discord.Interaction):
-    await interaction.followup.send(
+    await _reply(interaction, "prop", 
         "The AI explain feature isn't switched on yet. (It goes live once the "
         "`/api/explain` route is deployed on the backend and `AI_EXPLAIN_ENABLED=1`.)"
     )
@@ -1023,7 +1047,7 @@ async def _explain_disabled_notice(interaction: discord.Interaction):
 @bot.tree.command(name="explain", description="AI breakdown of why the model likes a play — built on Line Logic's own data")
 @app_commands.describe(query="Team, player, or matchup, e.g. Braves ML")
 async def explain_command(interaction: discord.Interaction, query: str):
-    await interaction.response.defer()
+    await interaction.response.defer(ephemeral=is_private("explain"))
     if not AI_EXPLAIN_ENABLED:
         await _explain_disabled_notice(interaction)
         return
@@ -1032,12 +1056,18 @@ async def explain_command(interaction: discord.Interaction, query: str):
             data = await fetch_json(session, "/api/generate", params={"q": query, "mode": "full"})
         except Exception:
             log.exception("explain failed for %s", query)
-            await interaction.followup.send(f"Couldn't generate a breakdown for **{query}** right now.")
+            await _reply(interaction, "explain", f"Couldn't generate a breakdown for **{query}** right now.")
             return
 
-    if not data.get("found") or not data.get("content"):
-        await interaction.followup.send(
-            f"No model play found for **{query}** to explain. Try a team that's on today's board."
+    if not data.get("found"):
+        await _reply(interaction, "explain", 
+            f"No model play found for **{query}**. Try a team that's on today's board."
+        )
+        return
+    if not data.get("content"):
+        await _reply(interaction, "explain", 
+            f"Found the play on **{query}**, but the AI write-up isn't available right now. "
+            "Try `/model` for the numbers in the meantime."
         )
         return
 
@@ -1055,13 +1085,13 @@ async def explain_command(interaction: discord.Interaction, query: str):
     embed.add_field(name="Market", value=_fmt_odds(data.get("market_odds")), inline=True)
     embed.add_field(name="Edge", value=edge_str, inline=True)
     embed.set_footer(text="AI explains the model's read — not a guarantee, and lines move. Line Logic")
-    await interaction.followup.send(embed=embed)
+    await _reply(interaction, "explain", embed=embed)
 
 
 @bot.tree.command(name="why", description="Quick bulleted reasons behind a model play")
 @app_commands.describe(query="Team or player, e.g. Braves")
 async def why_command(interaction: discord.Interaction, query: str):
-    await interaction.response.defer()
+    await interaction.response.defer(ephemeral=is_private("why"))
     if not AI_EXPLAIN_ENABLED:
         await _explain_disabled_notice(interaction)
         return
@@ -1070,12 +1100,12 @@ async def why_command(interaction: discord.Interaction, query: str):
             data = await fetch_json(session, "/api/generate", params={"q": query, "mode": "why"})
         except Exception:
             log.exception("why failed for %s", query)
-            await interaction.followup.send(f"Couldn't pull the quick view for **{query}** right now.")
+            await _reply(interaction, "why", f"Couldn't pull the quick view for **{query}** right now.")
             return
 
     bullets = data.get("bullets") or []
     if not data.get("found") or not bullets:
-        await interaction.followup.send(f"No model play found for **{query}**.")
+        await _reply(interaction, "why", f"No model play found for **{query}**.")
         return
 
     edge = data.get("edge_pct")
@@ -1088,13 +1118,13 @@ async def why_command(interaction: discord.Interaction, query: str):
         timestamp=now_utc(),
     )
     embed.set_footer(text="Run /explain for the full breakdown • Line Logic")
-    await interaction.followup.send(embed=embed)
+    await _reply(interaction, "why", embed=embed)
 
 
 @bot.tree.command(name="sources", description="What data fed a model play — honest provenance, no filler")
 @app_commands.describe(query="Team or player")
 async def sources_command(interaction: discord.Interaction, query: str):
-    await interaction.response.defer()
+    await interaction.response.defer(ephemeral=is_private("sources"))
     if not AI_EXPLAIN_ENABLED:
         await _explain_disabled_notice(interaction)
         return
@@ -1103,12 +1133,12 @@ async def sources_command(interaction: discord.Interaction, query: str):
             data = await fetch_json(session, "/api/generate", params={"q": query, "mode": "sources"})
         except Exception:
             log.exception("sources failed for %s", query)
-            await interaction.followup.send(f"Couldn't pull the data trail for **{query}** right now.")
+            await _reply(interaction, "sources", f"Couldn't pull the data trail for **{query}** right now.")
             return
 
     sources = data.get("sources") or {}
     if not data.get("found") or not sources:
-        await interaction.followup.send(f"No data trail available for **{query}**.")
+        await _reply(interaction, "sources", f"No data trail available for **{query}**.")
         return
 
     embed = discord.Embed(
@@ -1120,13 +1150,13 @@ async def sources_command(interaction: discord.Interaction, query: str):
     for label, src in list(sources.items())[:10]:
         embed.add_field(name=str(label), value=f"✓ {src}", inline=True)
     embed.set_footer(text="Line Logic • thelinelogic.com")
-    await interaction.followup.send(embed=embed)
+    await _reply(interaction, "sources", embed=embed)
 
 
 @bot.tree.command(name="confidence", description="What the model's confidence grade means for a play — not certainty of outcome")
 @app_commands.describe(query="Team or player, e.g. Braves")
 async def confidence_command(interaction: discord.Interaction, query: str):
-    await interaction.response.defer()
+    await interaction.response.defer(ephemeral=is_private("confidence"))
     if not AI_EXPLAIN_ENABLED:
         await _explain_disabled_notice(interaction)
         return
@@ -1135,11 +1165,15 @@ async def confidence_command(interaction: discord.Interaction, query: str):
             data = await fetch_json(session, "/api/generate", params={"q": query, "mode": "confidence"})
         except Exception:
             log.exception("confidence failed for %s", query)
-            await interaction.followup.send(f"Couldn't pull confidence for **{query}** right now.")
+            await _reply(interaction, "confidence", f"Couldn't pull confidence for **{query}** right now.")
             return
 
-    if not data.get("found") or not data.get("content"):
-        await interaction.followup.send(f"No model play found for **{query}**.")
+    if not data.get("found"):
+        await _reply(interaction, "confidence", f"No model play found for **{query}**.")
+        return
+    if not data.get("content"):
+        await _reply(interaction, "confidence", 
+            f"Found the play on **{query}**, but the AI output isn't available right now.")
         return
 
     embed = discord.Embed(
@@ -1149,13 +1183,13 @@ async def confidence_command(interaction: discord.Interaction, query: str):
         timestamp=now_utc(),
     )
     embed.set_footer(text="Confidence = quality of the opportunity, not certainty. Line Logic")
-    await interaction.followup.send(embed=embed)
+    await _reply(interaction, "confidence", embed=embed)
 
 
 @bot.tree.command(name="tweet", description="A ready-to-post X blurb for a model play (copy-paste)")
 @app_commands.describe(query="Team or player, e.g. Braves ML")
 async def tweet_command(interaction: discord.Interaction, query: str):
-    await interaction.response.defer()
+    await interaction.response.defer(ephemeral=is_private("tweet"))
     if not AI_EXPLAIN_ENABLED:
         await _explain_disabled_notice(interaction)
         return
@@ -1164,21 +1198,25 @@ async def tweet_command(interaction: discord.Interaction, query: str):
             data = await fetch_json(session, "/api/generate", params={"q": query, "mode": "tweet"})
         except Exception:
             log.exception("tweet failed for %s", query)
-            await interaction.followup.send(f"Couldn't draft a post for **{query}** right now.")
+            await _reply(interaction, "tweet", f"Couldn't draft a post for **{query}** right now.")
             return
 
-    if not data.get("found") or not data.get("content"):
-        await interaction.followup.send(f"No model play found for **{query}**.")
+    if not data.get("found"):
+        await _reply(interaction, "tweet", f"No model play found for **{query}**.")
+        return
+    if not data.get("content"):
+        await _reply(interaction, "tweet", 
+            f"Found the play on **{query}**, but the AI output isn't available right now.")
         return
 
     # Send as plain text in a code-style block so it's easy to copy on mobile
-    await interaction.followup.send(f"**Draft post — copy below:**\n>>> {data['content']}")
+    await _reply(interaction, "tweet", f"**Draft post — copy below:**\n>>> {data['content']}")
 
 
 @bot.tree.command(name="writeup", description="Long-form model breakdown (Overview, Model, Matchup, Market, Risks)")
 @app_commands.describe(query="Team or player, e.g. Braves")
 async def writeup_command(interaction: discord.Interaction, query: str):
-    await interaction.response.defer()
+    await interaction.response.defer(ephemeral=is_private("writeup"))
     if not AI_EXPLAIN_ENABLED:
         await _explain_disabled_notice(interaction)
         return
@@ -1187,11 +1225,15 @@ async def writeup_command(interaction: discord.Interaction, query: str):
             data = await fetch_json(session, "/api/generate", params={"q": query, "mode": "writeup"}, timeout=40)
         except Exception:
             log.exception("writeup failed for %s", query)
-            await interaction.followup.send(f"Couldn't generate a write-up for **{query}** right now.")
+            await _reply(interaction, "writeup", f"Couldn't generate a write-up for **{query}** right now.")
             return
 
-    if not data.get("found") or not data.get("content"):
-        await interaction.followup.send(f"No model play found for **{query}**.")
+    if not data.get("found"):
+        await _reply(interaction, "writeup", f"No model play found for **{query}**.")
+        return
+    if not data.get("content"):
+        await _reply(interaction, "writeup", 
+            f"Found the play on **{query}**, but the AI output isn't available right now.")
         return
 
     # Write-ups can exceed Discord's 2000-char message limit — chunk safely.
@@ -1202,17 +1244,17 @@ async def writeup_command(interaction: discord.Interaction, query: str):
     chunks = [text[i:i + 1900] for i in range(0, len(text), 1900)]
     chunks = [c for c in chunks if c.strip()]
     if not chunks:
-        await interaction.followup.send(f"No write-up available for **{query}** right now.")
+        await _reply(interaction, "writeup", f"No write-up available for **{query}** right now.")
         return
-    await interaction.followup.send(chunks[0])
+    await _reply(interaction, "writeup", chunks[0])
     for extra in chunks[1:]:
-        await interaction.followup.send(extra)
+        await _reply(interaction, "writeup", extra)
 
 
 @bot.tree.command(name="ask", description="Ask about a model play — grounded in Line Logic's data, not a general chatbot")
 @app_commands.describe(query="Team or player the question is about", question="Your question")
 async def ask_command(interaction: discord.Interaction, query: str, question: str):
-    await interaction.response.defer()
+    await interaction.response.defer(ephemeral=is_private("ask"))
     if not AI_EXPLAIN_ENABLED:
         await _explain_disabled_notice(interaction)
         return
@@ -1224,18 +1266,18 @@ async def ask_command(interaction: discord.Interaction, query: str, question: st
             )
         except Exception:
             log.exception("ask failed for %s", query)
-            await interaction.followup.send("Couldn't answer that right now — try again shortly.")
+            await _reply(interaction, "ask", "Couldn't answer that right now — try again shortly.")
             return
 
     if not data.get("found"):
-        await interaction.followup.send(
+        await _reply(interaction, "ask", 
             f"No model play found for **{query}**, so there's nothing grounded to answer from."
         )
         return
 
     answer = data.get("answer")
     if not answer:
-        await interaction.followup.send("The model doesn't include enough to answer that confidently.")
+        await _reply(interaction, "ask", "The model doesn't include enough to answer that confidently.")
         return
 
     embed = discord.Embed(
@@ -1245,7 +1287,7 @@ async def ask_command(interaction: discord.Interaction, query: str, question: st
         timestamp=now_utc(),
     )
     embed.set_footer(text="Grounded in Line Logic's model data • not betting advice")
-    await interaction.followup.send(embed=embed)
+    await _reply(interaction, "ask", embed=embed)
 
 
 # Static betting glossary — no LLM, no backend call, so it works even with AI off
@@ -1289,7 +1331,7 @@ async def learn_command(interaction: discord.Interaction, term: str):
         color=BRAND_COLOR,
     )
     embed.set_footer(text="Line Logic • learn the why, not just the pick")
-    await interaction.response.send_message(embed=embed)
+    await interaction.response.send_message(embed=embed, ephemeral=is_private("learn"))
 
 
 @bot.tree.command(name="track", description="Track a pick to your capper record (model-board picks only)")
@@ -1346,23 +1388,48 @@ async def track_command(interaction: discord.Interaction, pick: str,
     embed.add_field(name="Odds", value=odds_str, inline=True)
     embed.add_field(name="Stake", value=f"{data.get('stake_units', 1)}u", inline=True)
     embed.set_footer(text=f"Tracked by {interaction.user.display_name} • graded after the game")
-    await interaction.followup.send(embed=embed)
+
+    # Slips go to the community slips channel so they form a live feed there
+    # instead of flooding whatever channel the command was run in.
+    posted_to = None
+    if SLIPS_CHANNEL_ID and interaction.channel_id != SLIPS_CHANNEL_ID:
+        ch = bot.get_channel(SLIPS_CHANNEL_ID)
+        if ch is None:
+            try:
+                ch = await bot.fetch_channel(SLIPS_CHANNEL_ID)
+            except Exception:
+                ch = None
+        if ch is not None:
+            try:
+                await ch.send(embed=embed)
+                posted_to = ch
+            except Exception:
+                log.warning("slip post to slips channel failed", exc_info=True)
+
+    if posted_to is not None:
+        await interaction.followup.send(
+            f"✅ Tracked **{data.get('pick')}** at {odds_str} for {data.get('stake_units', 1)}u "
+            f"— posted in {posted_to.mention}.",
+            ephemeral=True,
+        )
+    else:
+        await interaction.followup.send(embed=embed)
 
 
 @bot.tree.command(name="mystats", description="Your capper record — tracked picks, W/L, units, ROI")
 async def mystats_command(interaction: discord.Interaction):
-    await interaction.response.defer()
+    await interaction.response.defer(ephemeral=is_private("mystats"))
     async with aiohttp.ClientSession() as session:
         try:
             data = await fetch_json(session, "/api/capper/stats",
                                     params={"user_id": str(interaction.user.id)}, timeout=20)
         except Exception:
             log.exception("mystats failed")
-            await interaction.followup.send("Couldn't pull your stats right now — try again shortly.")
+            await _reply(interaction, "mystats", "Couldn't pull your stats right now — try again shortly.")
             return
 
     if not data.get("total"):
-        await interaction.followup.send(
+        await _reply(interaction, "mystats", 
             "You haven't tracked any picks yet. Use `/track [team]` to start your record."
         )
         return
@@ -1405,7 +1472,7 @@ async def mystats_command(interaction: discord.Interaction):
     if lines:
         embed.add_field(name="By Sport", value="\n".join(lines), inline=False)
     embed.set_footer(text="Line Logic • track picks with /track")
-    await interaction.followup.send(embed=embed)
+    await _reply(interaction, "mystats", embed=embed)
 
 
 @bot.tree.command(name="cappers", description="The capper leaderboard — top tracked records in the server")
@@ -1974,7 +2041,7 @@ _STOCK_DISCLAIMER = ("Educational, paper-traded model signals — not financial 
 @bot.tree.command(name="stock", description="Market quote, or the day's hot pick if no ticker given")
 @app_commands.describe(symbol="Optional ticker, e.g. NVDA. Leave blank for the Hot Pick of the Day.")
 async def stock_command(interaction: discord.Interaction, symbol: str = ""):
-    await interaction.response.defer()
+    await interaction.response.defer(ephemeral=is_private("stock"))
     symbol = symbol.upper().strip()
 
     async with aiohttp.ClientSession() as session:
@@ -1984,11 +2051,11 @@ async def stock_command(interaction: discord.Interaction, symbol: str = ""):
                 data = await fetch_json(session, "/api/stocks/hotpick", timeout=30)
             except Exception:
                 log.exception("hotpick failed")
-                await interaction.followup.send("Market data isn't available right now.")
+                await _reply(interaction, "stock", "Market data isn't available right now.")
                 return
             hot = data.get("hot")
             if not hot:
-                await interaction.followup.send(
+                await _reply(interaction, "stock", 
                     "Nothing trending up steadily today — the model is holding its paper positions.\n"
                     f"_{_STOCK_DISCLAIMER}_"
                 )
@@ -2006,7 +2073,7 @@ async def stock_command(interaction: discord.Interaction, symbol: str = ""):
             if isinstance(vr, (int, float)) and vr >= 1.2:
                 embed.add_field(name="Volume", value=f"{round((vr - 1) * 100)}% above usual", inline=True)
             embed.set_footer(text=_STOCK_DISCLAIMER)
-            await interaction.followup.send(embed=embed)
+            await _reply(interaction, "stock", embed=embed)
             return
 
         # Ticker given -> on-demand quote (/api/stocks/quote)
@@ -2014,11 +2081,11 @@ async def stock_command(interaction: discord.Interaction, symbol: str = ""):
             data = await fetch_json(session, "/api/stocks/quote", params={"symbol": symbol, "range": "1D"}, timeout=25)
         except Exception:
             log.exception("stock quote failed for %s", symbol)
-            await interaction.followup.send(f"Couldn't pull a quote for **{symbol}** right now.")
+            await _reply(interaction, "stock", f"Couldn't pull a quote for **{symbol}** right now.")
             return
 
     if data.get("error"):
-        await interaction.followup.send(f"No price data for **{symbol}**.")
+        await _reply(interaction, "stock", f"No price data for **{symbol}**.")
         return
 
     chg = data.get("change_pct")
@@ -2032,7 +2099,7 @@ async def stock_command(interaction: discord.Interaction, symbol: str = ""):
     embed.add_field(name="Price", value=f"${data.get('price', '—')}", inline=True)
     embed.add_field(name="Change (1D)", value=f"{'▲' if up else '▼'} {chg_str}", inline=True)
     embed.set_footer(text=_STOCK_DISCLAIMER)
-    await interaction.followup.send(embed=embed)
+    await _reply(interaction, "stock", embed=embed)
 
 
 @bot.event
