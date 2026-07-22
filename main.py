@@ -652,16 +652,19 @@ async def _before_results_post():
     await bot.wait_until_ready()
 
 
-# ---------- Edge alerts ----------
-# Scans the board periodically and posts NEW plays above a threshold, pinging
-# that sport's role. Dedupes in memory so the same play isn't posted twice a day.
+# ---------- Whale + Edge alerts ----------
+# Two tiers, two channels:
+#   Whale (>= WHALE_MIN edge)  -> #whale-alerts, 🐋 role
+#   Edge  (EDGE_MIN..WHALE_MIN) -> #edge-alerts, sport role
+# Dedupes per day so nothing double-posts, and a play only fires in ONE tier.
 
 EDGE_ALERTS_ENABLED = os.environ.get("EDGE_ALERTS_ENABLED", "1") == "1"
-EDGE_ALERT_MIN = float(os.environ.get("EDGE_ALERT_MIN", "15"))      # % edge to fire (whale-level)
+WHALE_MIN = float(os.environ.get("WHALE_MIN", "12"))    # >= this = whale
+EDGE_MIN = float(os.environ.get("EDGE_MIN", "4"))       # this..WHALE_MIN = regular edge
 EDGE_ALERT_INTERVAL_MIN = int(os.environ.get("EDGE_ALERT_INTERVAL_MIN", "90"))
+EDGE_CHANNEL_ID = int(os.environ.get("CHANNEL_EDGE_ALERTS", "0"))
 # Low-tier tennis (ITF futures, Challengers) has thin, stale lines — big "edges"
-# there are usually data noise rather than real value, and most books barely
-# offer them. Excluded from alerts by default; override with EDGE_EXCLUDE_TIERS.
+# there are usually data noise rather than real value. Excluded from both tiers.
 EDGE_EXCLUDE_TIERS = {
     t.strip().upper()
     for t in os.environ.get("EDGE_EXCLUDE_TIERS", "ITF,CHALLENGER").split(",")
@@ -674,27 +677,35 @@ def _edge_key(p) -> str:
     return f"{p.get('sport')}|{p.get('match')}|{p.get('pick')}"
 
 
-async def scan_edge_alerts() -> int:
-    """Post any qualifying plays we haven't already alerted on today."""
-    if not EDGE_ALERTS_CHANNEL_ID:
-        return 0
-    channel = bot.get_channel(EDGE_ALERTS_CHANNEL_ID)
-    if channel is None:
+async def _resolve_channel(cid):
+    if not cid:
+        return None
+    ch = bot.get_channel(cid)
+    if ch is None:
         try:
-            channel = await bot.fetch_channel(EDGE_ALERTS_CHANNEL_ID)
+            ch = await bot.fetch_channel(cid)
         except Exception:
-            return 0
+            return None
+    return ch
+
+
+async def scan_edge_alerts() -> int:
+    """Scan the board; post NEW qualifying plays to the whale or edge channel."""
+    whale_ch = await _resolve_channel(EDGE_ALERTS_CHANNEL_ID)   # CHANNEL_WHALE_ALERTS
+    edge_ch = await _resolve_channel(EDGE_CHANNEL_ID)           # CHANNEL_EDGE_ALERTS
+    if whale_ch is None and edge_ch is None:
+        return 0
 
     async with aiohttp.ClientSession() as session:
         try:
             data = await fetch_json(session, "/api/picks/quick", timeout=25)
         except Exception:
-            log.warning("edge alert scan: board fetch failed")
+            log.warning("alert scan: board fetch failed")
             return 0
 
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     seen = _edge_seen.setdefault(today, set())
-    for k in list(_edge_seen.keys()):   # drop previous days so the dict stays small
+    for k in list(_edge_seen.keys()):
         if k != today:
             _edge_seen.pop(k, None)
 
@@ -702,7 +713,7 @@ async def scan_edge_alerts() -> int:
     skipped_tier = 0
     for p in (data.get("picks") or []):
         edge = p.get("edge_pct")
-        if not isinstance(edge, (int, float)) or edge < EDGE_ALERT_MIN:
+        if not isinstance(edge, (int, float)) or edge < EDGE_MIN:
             continue
         if p.get("market_odds") is None:
             continue
@@ -713,12 +724,31 @@ async def scan_edge_alerts() -> int:
         key = _edge_key(p)
         if key in seen:
             continue
+
+        is_whale = edge >= WHALE_MIN
+        target = whale_ch if is_whale else edge_ch
+        if target is None:
+            # tier has no channel configured — skip rather than misroute
+            continue
+
         prob_pct = round((p.get("prob") or 0) * 100)
-        embed = discord.Embed(
-            title=f"🐋 Whale Alert — {p.get('pick','—')}",
-            description=f"**{p.get('match', '')}**\nA rare **+{edge:.1f}%** edge just crossed the board.",
-            color=0x00E676, timestamp=now_utc(),
-        )
+        if is_whale:
+            embed = discord.Embed(
+                title=f"🐋 Whale Alert — {p.get('pick','—')}",
+                description=f"**{p.get('match', '')}**\nA rare **+{edge:.1f}%** edge just crossed the board.",
+                color=0x00E676, timestamp=now_utc(),
+            )
+            footer = "Big edges carry big variance — still not a guarantee • thelinelogic.com"
+            mention = role_mention("whale") or role_mention(str(p.get("sport", "")).lower())
+        else:
+            embed = discord.Embed(
+                title=f"📈 Edge Play — {p.get('pick','—')}",
+                description=f"**{p.get('match', '')}**\nThe model has a **+{edge:.1f}%** edge here.",
+                color=BRAND_COLOR, timestamp=now_utc(),
+            )
+            footer = "Value play, not a guarantee • thelinelogic.com"
+            mention = role_mention(str(p.get("sport", "")).lower())
+
         embed.add_field(name="Sport", value=str(p.get("sport", "")).upper(), inline=True)
         embed.add_field(name="Model", value=f"{prob_pct}%", inline=True)
         embed.add_field(name="Market line", value=_fmt_odds(p.get("market_odds")), inline=True)
@@ -726,18 +756,18 @@ async def scan_edge_alerts() -> int:
         embed.add_field(name="Edge", value=f"**+{edge:.1f}%**", inline=True)
         if p.get("event_time"):
             embed.add_field(name="Start", value=str(p["event_time"]), inline=True)
-        embed.set_footer(text="Big edges carry big variance — still not a guarantee • thelinelogic.com")
-        # dedicated whale role; fall back to the sport role only if it isn't set
-        mention = role_mention("whale") or role_mention(str(p.get("sport", "")).lower())
+        embed.set_footer(text=footer)
+
         try:
-            await channel.send(content=mention or None, embed=embed)
+            await target.send(content=mention or None, embed=embed)
             seen.add(key)
             posted += 1
             await asyncio.sleep(1)
         except Exception:
-            log.warning("edge alert send failed", exc_info=True)
+            log.warning("alert send failed", exc_info=True)
+
     if posted or skipped_tier:
-        note = f"Posted {posted} edge alert(s)."
+        note = f"Posted {posted} alert(s)."
         if skipped_tier:
             note += f" Skipped {skipped_tier} low-tier tennis play(s)."
         await bot_log(note)
@@ -1847,14 +1877,14 @@ async def scanedges_command(interaction: discord.Interaction):
     if not perms or not (perms.manage_guild or perms.administrator):
         await interaction.response.send_message("That's a staff-only command.", ephemeral=True)
         return
-    if not EDGE_ALERTS_CHANNEL_ID:
-        await interaction.response.send_message("CHANNEL_EDGE_ALERTS isn't set.", ephemeral=True)
+    if not (EDGE_ALERTS_CHANNEL_ID or EDGE_CHANNEL_ID):
+        await interaction.response.send_message("No alert channel set (CHANNEL_WHALE_ALERTS / CHANNEL_EDGE_ALERTS).", ephemeral=True)
         return
     await interaction.response.defer(ephemeral=True)
     n = await scan_edge_alerts()
     await interaction.followup.send(
         f"Posted {n} edge alert(s)." if n else
-        f"No new whale plays (+{EDGE_ALERT_MIN:.0f}% edge or better) right now.", ephemeral=True)
+        f"No new plays at or above +{EDGE_MIN:.0f}% edge right now.", ephemeral=True)
 
 
 @bot.tree.command(name="ticketpanel", description="(Staff) Post the ticket button panel in this channel")
@@ -2193,9 +2223,9 @@ async def on_ready():
     if RESULTS_POST_ENABLED and not results_post_loop.is_running():
         results_post_loop.start()
         log.info("Results recap scheduled for %02d:00 UTC", RESULTS_POST_HOUR_UTC)
-    if EDGE_ALERTS_ENABLED and EDGE_ALERTS_CHANNEL_ID and not edge_alert_loop.is_running():
+    if EDGE_ALERTS_ENABLED and (EDGE_ALERTS_CHANNEL_ID or EDGE_CHANNEL_ID) and not edge_alert_loop.is_running():
         edge_alert_loop.start()
-        log.info("Edge alerts every %d min (min edge %.1f%%)", EDGE_ALERT_INTERVAL_MIN, EDGE_ALERT_MIN)
+        log.info("Alerts every %d min (edge>=%.0f%%, whale>=%.0f%%)", EDGE_ALERT_INTERVAL_MIN, EDGE_MIN, WHALE_MIN)
     if LADDER_POST_ENABLED and not ladder_post_loop.is_running():
         ladder_post_loop.start()
         log.info("Ladder post scheduled for %02d:10 UTC", LADDER_POST_HOUR_UTC)
