@@ -79,6 +79,7 @@ NOTIFY_ROLE_IDS = {
     "stocks": int(os.environ.get("ROLE_STOCK_ALERTS", "0")),
     "line_movement": int(os.environ.get("ROLE_LINE_MOVEMENT_ALERTS", "0")),
     "ladder": int(os.environ.get("ROLE_LADDER_ALERTS", "0")),
+    "whale": int(os.environ.get("ROLE_WHALE_ALERTS", "0")),
 }
 
 BRAND_COLOR = int(os.environ.get("BRAND_COLOR_HEX", "2B6CB0"), 16)
@@ -656,7 +657,7 @@ async def _before_results_post():
 # that sport's role. Dedupes in memory so the same play isn't posted twice a day.
 
 EDGE_ALERTS_ENABLED = os.environ.get("EDGE_ALERTS_ENABLED", "1") == "1"
-EDGE_ALERT_MIN = float(os.environ.get("EDGE_ALERT_MIN", "6"))       # % edge to fire
+EDGE_ALERT_MIN = float(os.environ.get("EDGE_ALERT_MIN", "15"))      # % edge to fire (whale-level)
 EDGE_ALERT_INTERVAL_MIN = int(os.environ.get("EDGE_ALERT_INTERVAL_MIN", "90"))
 # Low-tier tennis (ITF futures, Challengers) has thin, stale lines — big "edges"
 # there are usually data noise rather than real value, and most books barely
@@ -714,19 +715,20 @@ async def scan_edge_alerts() -> int:
             continue
         prob_pct = round((p.get("prob") or 0) * 100)
         embed = discord.Embed(
-            title=f"⚡ Edge Alert — {p.get('pick','—')}",
-            description=p.get("match", ""),
-            color=0x2ECC71, timestamp=now_utc(),
+            title=f"🐋 Whale Alert — {p.get('pick','—')}",
+            description=f"**{p.get('match', '')}**\nA rare **+{edge:.1f}%** edge just crossed the board.",
+            color=0x00E676, timestamp=now_utc(),
         )
         embed.add_field(name="Sport", value=str(p.get("sport", "")).upper(), inline=True)
         embed.add_field(name="Model", value=f"{prob_pct}%", inline=True)
-        embed.add_field(name="Market", value=_fmt_odds(p.get("market_odds")), inline=True)
-        embed.add_field(name="Fair", value=_fmt_odds(p.get("fair_odds")), inline=True)
+        embed.add_field(name="Market line", value=_fmt_odds(p.get("market_odds")), inline=True)
+        embed.add_field(name="Model fair line", value=_fmt_odds(p.get("fair_odds")), inline=True)
         embed.add_field(name="Edge", value=f"**+{edge:.1f}%**", inline=True)
         if p.get("event_time"):
             embed.add_field(name="Start", value=str(p["event_time"]), inline=True)
-        embed.set_footer(text="Value play, not a guarantee • thelinelogic.com")
-        mention = role_mention(str(p.get("sport", "")).lower())
+        embed.set_footer(text="Big edges carry big variance — still not a guarantee • thelinelogic.com")
+        # dedicated whale role; fall back to the sport role only if it isn't set
+        mention = role_mention("whale") or role_mention(str(p.get("sport", "")).lower())
         try:
             await channel.send(content=mention or None, embed=embed)
             seen.add(key)
@@ -758,6 +760,76 @@ async def _before_edge_alerts():
 
 
 # ---------- Slash commands ----------
+
+@bot.tree.command(name="ev", description="Expected value calculator — compare your sportsbook's odds to a win probability")
+@app_commands.describe(
+    odds="The American odds at your book (e.g. -110, +145)",
+    win_prob="True win probability as a percent (e.g. 55) or decimal (0.55)",
+    stake="Optional stake in units (default 1)",
+)
+async def ev_command(interaction: discord.Interaction, odds: int,
+                     win_prob: float, stake: float = 1.0):
+    # accept 55 or 0.55
+    p = win_prob / 100.0 if win_prob > 1 else win_prob
+    if not (0 < p < 1):
+        await interaction.response.send_message(
+            "Win probability should be between 0 and 100 (e.g. `55`) or 0 and 1 (e.g. `0.55`).",
+            ephemeral=True)
+        return
+    if odds == 0 or -100 < odds < 100:
+        await interaction.response.send_message(
+            "American odds must be ≥ +100 or ≤ -100 (e.g. `+145` or `-110`).",
+            ephemeral=True)
+        return
+
+    stake = max(0.1, min(stake, 1000.0))
+    # profit on a win, per unit staked
+    win_profit = (odds / 100.0) if odds > 0 else (100.0 / abs(odds))
+    # implied probability from the odds (with vig)
+    implied = (100.0 / (odds + 100.0)) if odds > 0 else (abs(odds) / (abs(odds) + 100.0))
+    # EV per unit
+    ev_unit = p * win_profit - (1 - p) * 1.0
+    ev_total = ev_unit * stake
+    ev_pct = ev_unit * 100.0
+    # break-even prob = implied prob; edge = your prob minus implied
+    edge = (p - implied) * 100.0
+    # fair (no-vig) American odds for your probability
+    if p >= 0.5:
+        fair = -round((p / (1 - p)) * 100)
+    else:
+        fair = round(((1 - p) / p) * 100)
+    fair_str = f"+{fair}" if fair > 0 else str(fair)
+
+    positive = ev_unit > 0
+    embed = discord.Embed(
+        title="🧮 Expected Value",
+        description=("**+EV — worth it** ✅" if positive else "**−EV — the price is too short** ❌"),
+        color=(0x2ECC71 if positive else 0xE74C3C),
+        timestamp=now_utc(),
+    )
+    embed.add_field(name="Your odds", value=_fmt_odds(odds), inline=True)
+    embed.add_field(name="Your win %", value=f"{p*100:.1f}%", inline=True)
+    embed.add_field(name="Stake", value=f"{stake:g}u", inline=True)
+    embed.add_field(name="Implied % (book)", value=f"{implied*100:.1f}%", inline=True)
+    embed.add_field(name="Fair odds", value=fair_str, inline=True)
+    embed.add_field(name="Edge", value=f"{edge:+.1f}%", inline=True)
+    embed.add_field(
+        name="Expected Value",
+        value=f"**{ev_total:+.2f}u** per {stake:g}u bet  ({ev_pct:+.1f}% of stake)",
+        inline=False,
+    )
+    embed.add_field(
+        name="What this means",
+        value=(f"At {_fmt_odds(odds)} you break even at **{implied*100:.1f}%**. "
+               f"You think it wins **{p*100:.1f}%**, so this bet is "
+               + ("**+EV** — mathematically profitable long-term."
+                  if positive else "**−EV** — you'd lose money on this repeatedly.")),
+        inline=False,
+    )
+    embed.set_footer(text="EV is long-run math, not a guarantee on any single bet • Line Logic")
+    await interaction.response.send_message(embed=embed, ephemeral=is_private("ev"))
+
+
 
 def _fmt_odds(v):
     """American odds as a display string (+150 / -164 / —)."""
@@ -1782,7 +1854,7 @@ async def scanedges_command(interaction: discord.Interaction):
     n = await scan_edge_alerts()
     await interaction.followup.send(
         f"Posted {n} edge alert(s)." if n else
-        f"No new plays at or above +{EDGE_ALERT_MIN:.0f}% edge right now.", ephemeral=True)
+        f"No new whale plays (+{EDGE_ALERT_MIN:.0f}% edge or better) right now.", ephemeral=True)
 
 
 @bot.tree.command(name="ticketpanel", description="(Staff) Post the ticket button panel in this channel")
