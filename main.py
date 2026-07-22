@@ -35,7 +35,7 @@ WELCOME_CHANNEL_ID = int(os.environ.get("CHANNEL_WELCOME", "0"))
 BOT_LOGS_CHANNEL_ID = int(os.environ.get("CHANNEL_BOT_LOGS", "0"))
 VERIFIED_ROLE_ID = int(os.environ.get("VERIFIED_ROLE_ID", "0"))
 TICKETS_CHANNEL_ID = int(os.environ.get("CHANNEL_TICKETS", "0"))
-EDGE_ALERTS_CHANNEL_ID = int(os.environ.get("CHANNEL_EDGE_ALERTS", "0"))
+EDGE_ALERTS_CHANNEL_ID = int(os.environ.get("CHANNEL_WHALE_ALERTS") or os.environ.get("CHANNEL_EDGE_ALERTS") or "0")
 SLIPS_CHANNEL_ID = int(os.environ.get("CHANNEL_SLIPS", "0"))
 # Personal lookups reply privately so they don't flood chat. Anything listed in
 # PUBLIC_COMMANDS replies visibly instead (comma-separated command names).
